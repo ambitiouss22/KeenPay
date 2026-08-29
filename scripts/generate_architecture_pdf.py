@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate KeenPay Production Architecture & Systems Design PDF."""
+"""Build docs/KeenPay_Architecture_Workflow.pdf from the architecture spec."""
 
 from pathlib import Path
 from fpdf import FPDF
@@ -104,8 +104,7 @@ def build_cover(pdf: KeenPayPDF):
     pdf.ln(12)
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(203, 213, 225)
-    pdf.cell(0, 6, "Document Status: Approved for Implementation", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, "Author: Lead Systems Architect", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, "Internal architecture reference", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(16)
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(148, 163, 184)
@@ -128,8 +127,7 @@ def build_philosophy(pdf: KeenPayPDF):
     )
     pdf.body_text(
         "We prioritize a pragmatic, monolithic-first API using FastAPI, PostgreSQL, and Redis. "
-        "It is simple enough to deploy in minutes, but robust enough to handle enterprise concurrency "
-        "and strict audit compliance."
+        "Simple enough to deploy quickly, robust enough for audit and concurrency."
     )
 
     pdf.subsection_title("Air-Gap Model: Grow / Sell / Protect")
@@ -449,8 +447,16 @@ def main():
     build_transaction_passport(pdf)
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-    pdf.output(str(OUTPUT))
-    print(f"PDF generated: {OUTPUT}")
+    fallback = OUTPUT.with_name(OUTPUT.stem + "_latest.pdf")
+    for path in (OUTPUT, fallback):
+        try:
+            pdf.output(str(path))
+            print(f"PDF generated: {path}")
+            break
+        except PermissionError:
+            if path == fallback:
+                raise
+            print(f"Could not overwrite {OUTPUT} (file may be open); writing {fallback}")
 
 
 if __name__ == "__main__":

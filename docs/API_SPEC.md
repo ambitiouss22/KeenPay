@@ -1,10 +1,14 @@
-# KeenPay — API Specification
+# KeenPay — API spec
 
-**Version:** 1.0.0  
-**Base URL:** `https://api.keenpay.example` (production) · `http://localhost:8000` (local)  
-**API Prefix:** `/api/v1`  
-**WebSocket:** `/ws/v1/session`  
-**Content-Type:** `application/json` unless noted
+Contracts for REST, WebSocket, and Razorpay webhooks. Implement against this; change the spec before changing behavior.
+
+- Production base: `https://api.keenpay.example`
+- Local: `http://localhost:8000`
+- Prefix: `/api/v1`
+- WebSocket: `/ws/v1/session`
+- JSON unless noted
+
+Money endpoints never trust client-supplied totals — server uses `approved_offer.final_amount_paise` from guardrail state.
 
 ---
 
@@ -754,7 +758,9 @@ class GuardrailDecisionOut(BaseModel):
 
 ---
 
-## 5. Razorpay Integration (Mock + Production)
+## 5. Razorpay integration (test + production)
+
+Use Razorpay test keys locally. Link creation runs only after `assert_payment_gates()` in `api/services/razorpay.py`. The amount sent to Razorpay always comes from `orders.final_amount_paise` on the server — never from the client payload.
 
 ### 5.1 Configuration
 

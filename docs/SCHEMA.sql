@@ -1,7 +1,6 @@
--- KeenPay PostgreSQL Schema
--- Version: 1.0.0
--- Target: PostgreSQL 15+
--- Encoding: UTF8
+-- KeenPay PostgreSQL schema
+-- Postgres 15+. Run: psql $DATABASE_URL -f docs/SCHEMA.sql
+-- Money fields are integer paise. audit_logs is append-only (see triggers below).
 
 BEGIN;
 
@@ -79,7 +78,7 @@ CREATE TABLE products (
   CONSTRAINT products_reserved_lte_on_hand CHECK (quantity_reserved <= quantity_on_hand)
 );
 
-COMMENT ON TABLE products IS 'Merchant catalog with inventory and cost basis for margin guardrails';
+COMMENT ON TABLE products IS 'Catalog; cost_paise feeds RULE_MIN_MARGIN';
 COMMENT ON COLUMN products.cost_paise IS 'Used by RULE_MIN_MARGIN policy evaluation';
 COMMENT ON COLUMN products.attributes IS 'Structured attrs: color, size, category, etc.';
 
@@ -142,7 +141,7 @@ CREATE TABLE negotiation_sessions (
   CONSTRAINT negotiation_sessions_currency_inr CHECK (currency = 'INR')
 );
 
-COMMENT ON TABLE negotiation_sessions IS 'Agentic checkout session state; mirrors LangGraph KeenPayState';
+COMMENT ON TABLE negotiation_sessions IS 'LangGraph session mirror; see ARCHITECTURE.md for state fields';
 COMMENT ON COLUMN negotiation_sessions.langgraph_thread_id IS 'LangGraph checkpointer thread_id (equals id by convention)';
 COMMENT ON COLUMN negotiation_sessions.guardrail_detail IS 'Full GuardrailDecision JSON including per-rule results';
 
@@ -197,7 +196,7 @@ CREATE TABLE orders (
   CONSTRAINT orders_idempotency_unique UNIQUE (idempotency_key)
 );
 
-COMMENT ON TABLE orders IS 'Created only after guardrail APPROVED + user confirmation';
+COMMENT ON TABLE orders IS 'Created only after guardrail APPROVED and user_confirmed_payment';
 COMMENT ON COLUMN orders.line_items IS 'Array of {sku, name, quantity, unit_price_paise, line_total_paise}';
 COMMENT ON COLUMN orders.guardrail_decision_id IS 'Links order amount to policy evaluation audit trail';
 
@@ -239,7 +238,7 @@ CREATE TABLE audit_logs (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-COMMENT ON TABLE audit_logs IS 'Append-only audit trail for all money actions and guardrail decisions';
+COMMENT ON TABLE audit_logs IS 'Append-only; money actions and guardrail evals. Do not UPDATE.';
 COMMENT ON COLUMN audit_logs.trace_metadata IS 'LangGraph node, duration_ms, rule_id, anomaly_score, etc.';
 COMMENT ON COLUMN audit_logs.input_snapshot IS 'e.g. proposed_offer, policy_version, user_message hash';
 COMMENT ON COLUMN audit_logs.output_snapshot IS 'e.g. guardrail outcome, payment_link_id, error codes';
