@@ -582,7 +582,10 @@ def test_realistic_vip_checkout_workflow(engine, hoodie_policy):
     # Verify decision contains required fields
     assert decision.reason is not None
     assert decision.timestamp is not None
-    assert decision.approved_discount_pct <= hoodie_policy.max_discount_pct
+    # Bounded by the ceiling that actually applies to this user's tier.
+    # VIP carries an explicit override (35%) that intentionally sits above the
+    # global default of 25%, so max_discount_pct is not the bound here.
+    assert decision.approved_discount_pct <= hoodie_policy.get_max_discount_for_user("vip")
 
 
 def test_realistic_budget_exhaustion_workflow(engine, hoodie_policy):
