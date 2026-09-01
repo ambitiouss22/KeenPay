@@ -1,0 +1,25 @@
+# Normalize line endings.
+# Text files are stored as LF in the repository and checked out as LF,
+# so the same file never shows a whole-file diff just because a
+# contributor is on Windows instead of Linux/macOS or Docker.
+* text=auto eol=lf
+
+# Windows-native scripts must keep CRLF to run correctly.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files: never touch line endings, never try to diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.woff binary
+*.woff2 binary
+*.db   binary
+*.sqlite binary
+*.sqlite3 binary
