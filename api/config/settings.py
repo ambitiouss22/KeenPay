@@ -11,7 +11,9 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_version: str = "0.1.0"
     log_level: str = "INFO"
-    api_host: str = "0.0.0.0"
+    # Binding all interfaces is required inside a container; the process is
+    # reached only through the reverse proxy, never exposed directly.
+    api_host: str = "0.0.0.0"  # noqa: S104  # nosec B104
     api_port: int = 8000
 
     database_url: str = "postgresql+asyncpg://keenpay:keenpay@localhost:5432/keenpay"
