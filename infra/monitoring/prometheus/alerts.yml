@@ -1,0 +1,26 @@
+groups:
+  - name: keenpay-api
+    rules:
+      - alert: KeenPayAPIDown
+        expr: up{job="keenpay-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KeenPay API is down"
+
+      - alert: KeenPayHighErrorRate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated 5xx error rate on KeenPay API"
+
+      - alert: KeenPayAuthFailures
+        expr: rate(keenpay_auth_failures_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High authentication failure rate"

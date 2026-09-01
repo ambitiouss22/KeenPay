@@ -1,0 +1,28 @@
+# CI integration test stack — ephemeral, no published ports except api
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: keenpay
+      POSTGRES_PASSWORD: keenpay
+      POSTGRES_DB: keenpay_test
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+
+  api:
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://keenpay:keenpay@postgres:5432/keenpay_test
+      REDIS_URL: redis://redis:6379/0
+      RAZORPAY_MOCK: "true"
+      JWT_SECRET: test-secret
+    depends_on:
+      - postgres
+      - redis

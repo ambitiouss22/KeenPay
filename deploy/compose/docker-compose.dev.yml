@@ -1,0 +1,20 @@
+# Dev overrides — hot reload, mock Razorpay
+services:
+  api:
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ../../api:/app
+    environment:
+      RAZORPAY_MOCK: "true"
+      ENABLE_DEV_ROUTES: "true"
+
+  web:
+    command: npm run dev
+    volumes:
+      - ../../frontend:/app
+      - /app/node_modules
+
+  worker:
+    volumes:
+      - ../../workers:/app
+      - ../../api:/api
