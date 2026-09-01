@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config.logging import configure_logging
 from config.settings import get_settings
@@ -51,6 +52,25 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=status_code,
             content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}},
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
+        """Keep one error envelope across the whole API.
+
+        Routes raise HTTPException(detail={"error": {...}}). FastAPI's default
+        handler returns that as {"detail": {"error": ...}} -- a second shape
+        alongside the {"error": ...} KeenPayError already produces, so a client
+        would have to parse two contracts. Unwrap it here rather than rewriting
+        every raise site.
+        """
+        headers = getattr(exc, "headers", None)
+        if isinstance(exc.detail, dict) and "error" in exc.detail:
+            return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=headers)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": {"code": "HTTP_ERROR", "message": str(exc.detail)}},
+            headers=headers,
         )
 
     app.include_router(health.router)
