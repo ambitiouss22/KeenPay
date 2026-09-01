@@ -1,0 +1,11 @@
+{
+  "merchant_id": "merchant_keen",
+  "currency": "INR",
+  "rules": {
+    "max_discount_pct": 15.0,
+    "min_margin_pct": 20.0,
+    "max_negotiation_rounds": 5,
+    "inventory_hold_minutes": 15,
+    "payment_link_rate_limit_per_hour": 3
+  }
+}
