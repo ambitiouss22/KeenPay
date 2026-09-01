@@ -3,11 +3,26 @@ Discount Policy Engine - Merchant-Defined Discount Bounds
 
 This module enforces merchant-configured discount limits, preventing AI from
 proposing discounts outside safe bounds. Implements the "bounded AI" pattern.
+
+Design notes
+------------
+* Global `max_discount_pct` is the default ceiling for any user segment that
+  does NOT have an explicit override.
+* `per_user_type` entries are deliberate merchant overrides and MAY exceed the
+  global ceiling (e.g. global 25%, VIP 35%). The global value is a default,
+  not a hard cap, so merchants can reward specific tiers.
+* Budget accounting uses a reference product price of INR 1000 (100_000 paise),
+  so a 1% discount costs 1000 paise. This keeps percentage-based decisions
+  comparable against a paise-denominated daily budget.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+
+# Reference price used to convert a discount percentage into paise.
+# INR 1000 product => 1% discount costs 1000 paise.
+PAISE_PER_DISCOUNT_PCT = 1000
 
 
 class UserType(str, Enum):
@@ -40,41 +55,53 @@ class DiscountPolicy:
     merchant_id: str
     product_sku: str
 
-    # Global limit
-    max_discount_pct: float  # Absolute max across all users
+    # Global limit (default ceiling for segments without an override)
+    max_discount_pct: float
 
-    # Per-segment limits
-    per_user_type: dict[UserType, float] = field(default_factory=dict)
-    # Example: {UserType.NEW: 10.0, UserType.VIP: 25.0}
-
-    # Bounds
+    # Bounds (no defaults - must come before fields with defaults)
     daily_budget_paise: int  # Total discount budget per day
-    weekly_budget_paise: int = 0  # Optional weekly cap
+
+    # Per-segment overrides. MAY exceed max_discount_pct.
+    per_user_type: dict[UserType, float] = field(default_factory=dict)
+    # Example: {UserType.VIP: 35.0, UserType.BULK_BUYER: 30.0}
+
+    # Optional bounds
+    weekly_budget_paise: int = 0
 
     # Blacklisted combinations
     blacklist_combos: list[str] = field(default_factory=list)
-    # Example: ["free_shipping+50pct_off", "buy_one_get_one+discount"]
+    # Example: ["free_shipping+50pct_off"]
 
     # Policy metadata
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     is_active: bool = True
 
+    def has_segment_override(self, user_type: str) -> bool:
+        """True if this user type has an explicit per-segment limit."""
+        return self._resolve_segment(user_type) in self.per_user_type
+
+    def _resolve_segment(self, user_type: str) -> UserType:
+        """Map a raw user_type string to a UserType, defaulting to RETURNING."""
+        try:
+            return UserType(user_type.lower())
+        except ValueError:
+            return UserType.RETURNING
+
     def get_max_discount_for_user(self, user_type: str) -> float:
         """
-        Get maximum discount allowed for a user type.
+        Maximum discount allowed for a user type.
 
-        Returns the lesser of:
-        - Global maximum
-        - User-type-specific maximum
+        An explicit per-segment override wins outright and may exceed the
+        global ceiling. Segments without an override fall back to the global
+        maximum.
         """
-        try:
-            user_segment = UserType(user_type.lower())
-        except ValueError:
-            user_segment = UserType.RETURNING  # Default fallback
+        segment = self._resolve_segment(user_type)
 
-        segment_max = self.per_user_type.get(user_segment, self.max_discount_pct)
-        return min(self.max_discount_pct, segment_max)
+        if segment in self.per_user_type:
+            return self.per_user_type[segment]
+
+        return self.max_discount_pct
 
 
 @dataclass
@@ -116,8 +143,8 @@ class DiscountPolicyEngine:
 
     Design Principle: Bounded AI
     - AI proposes within merchant-defined limits
-    - Not "AI proposes anything → guardrail blocks"
-    - But "AI proposes within bounds → guardrail verifies"
+    - Not "AI proposes anything -> guardrail blocks"
+    - But "AI proposes within bounds -> guardrail verifies"
     """
 
     def __init__(self):
@@ -126,6 +153,8 @@ class DiscountPolicyEngine:
         self._daily_usage: dict[str, int] = {}  # {policy_id: total_paise_used_today}
         self._weekly_usage: dict[str, int] = {}
 
+    # -- policy management ------------------------------------------------
+
     def register_policy(self, policy: DiscountPolicy) -> None:
         """Register a new discount policy"""
         if not policy.is_active:
@@ -133,7 +162,7 @@ class DiscountPolicyEngine:
 
         self._policies[policy.policy_id] = policy
 
-    def get_policy(self, merchant_id: str, product_sku: str) -> DiscountPolicy | None:
+    def get_policy(self, merchant_id: str, product_sku: str) -> "DiscountPolicy | None":
         """Retrieve policy for a merchant's product"""
         for policy in self._policies.values():
             if policy.merchant_id == merchant_id and policy.product_sku == product_sku:
@@ -141,12 +170,35 @@ class DiscountPolicyEngine:
                     return policy
         return None
 
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _pct_to_paise(discount_pct: float) -> int:
+        """Convert a discount percentage into its paise cost."""
+        return int(discount_pct * PAISE_PER_DISCOUNT_PCT)
+
+    @staticmethod
+    def _paise_to_pct(paise: int) -> float:
+        """Convert a paise budget into the discount percentage it can fund."""
+        return paise / PAISE_PER_DISCOUNT_PCT
+
+    # -- main entry point -------------------------------------------------
+
     def check_discount_request(self, request: DiscountRequest) -> DiscountDecision:
         """
         Check if requested discount is within policy bounds.
 
-        Returns approved discount (may be less than requested).
+        Returns the approved discount, which may be less than requested.
         """
+        # Step 0: Reject invalid input outright
+        if request.requested_discount_pct < 0:
+            return DiscountDecision(
+                approved=False,
+                approved_discount_pct=0.0,
+                reason="Negative discounts are not allowed",
+                policy_applied="NEGATIVE_DISCOUNT_REJECTED",
+            )
+
         # Step 1: Get merchant's policy for this product
         policy = self.get_policy(request.merchant_id, request.product_sku)
 
@@ -159,52 +211,69 @@ class DiscountPolicyEngine:
                 policy_applied="NO_POLICY",
             )
 
-        # Step 2: Check user type limit
+        # Step 2: Apply the ceiling for this user's segment
         max_for_user = policy.get_max_discount_for_user(request.user_type)
 
         if request.requested_discount_pct > max_for_user:
             approved_discount = max_for_user
-            reason = f"Your tier ({request.user_type}) gets up to {max_for_user}% off"
-            policy_applied = f"USER_TYPE_LIMIT_{request.user_type}"
+
+            if policy.has_segment_override(request.user_type):
+                # A deliberate per-tier limit produced this number
+                reason = f"Your tier ({request.user_type}) gets up to {max_for_user}% off"
+                policy_applied = f"USER_TYPE_LIMIT_{request.user_type}"
+            else:
+                # No tier override, so the global ceiling produced this number
+                reason = f"Maximum discount is up to {max_for_user}% off"
+                policy_applied = "GLOBAL_MAX_LIMIT"
         else:
             approved_discount = request.requested_discount_pct
             reason = f"Discount approved: {approved_discount}% off"
             policy_applied = f"WITHIN_LIMIT_{request.user_type}"
 
-        # Step 3: Check daily budget
+        # Step 3: Enforce the daily budget
         daily_used = self._daily_usage.get(policy.policy_id, 0)
-        approved_amount_paise = int(approved_discount / 100.0)  # Simplified
+        projected_cost_paise = self._pct_to_paise(approved_discount)
 
-        if daily_used + approved_amount_paise > policy.daily_budget_paise:
-            # Budget exceeded, reduce discount
+        if daily_used + projected_cost_paise > policy.daily_budget_paise:
             remaining_budget = policy.daily_budget_paise - daily_used
+
             if remaining_budget <= 0:
-                approved_discount = 0
-                reason = "Daily discount budget exhausted"
-                policy_applied = "DAILY_BUDGET_EXCEEDED"
-            else:
-                # Give partial discount from remaining budget
-                approved_discount = min(approved_discount, 50)  # Conservative cap
-                reason = f"Daily budget limit: reduced to {approved_discount}%"
-                policy_applied = "DAILY_BUDGET_PARTIAL"
+                # Nothing left today: deny outright and record no usage
+                return DiscountDecision(
+                    approved=False,
+                    approved_discount_pct=0.0,
+                    reason="Daily discount budget exhausted",
+                    policy_applied="DAILY_BUDGET_EXCEEDED",
+                )
+
+            # Partial budget left: shrink the discount so it fits
+            affordable_discount = self._paise_to_pct(remaining_budget)
+            approved_discount = min(approved_discount, affordable_discount)
+            reason = f"Daily budget limit: reduced to {approved_discount}% off"
+            policy_applied = "DAILY_BUDGET_PARTIAL"
 
         # Step 4: Check blacklisted combinations
         combo_key = f"{approved_discount}pct_off"
         if combo_key in policy.blacklist_combos:
-            approved_discount = max(0, approved_discount - 5)  # Reduce by 5%
-            reason = f"Cannot combine with other offers. Adjusted to {approved_discount}%"
+            approved_discount = max(0.0, approved_discount - 5)
+            reason = f"Cannot combine with other offers. Adjusted to {approved_discount}% off"
             policy_applied = "BLACKLIST_COMBO_ADJUSTED"
 
-        # Step 5: Record usage (only if approved)
+        # Step 5: Record usage for any non-zero approved discount
         if approved_discount > 0:
-            self._daily_usage[policy.policy_id] = daily_used + int(approved_discount / 100.0)
+            self._daily_usage[policy.policy_id] = daily_used + self._pct_to_paise(
+                approved_discount
+            )
 
+        # A 0% outcome that reached this point is a valid, approved decision.
         return DiscountDecision(
-            approved=approved_discount > 0,
+            approved=True,
             approved_discount_pct=approved_discount,
             reason=reason,
             policy_applied=policy_applied,
         )
+
+    # -- budget maintenance -----------------------------------------------
 
     def reset_daily_budget(self, policy_id: str) -> None:
         """Reset daily usage counter (call at midnight)"""
