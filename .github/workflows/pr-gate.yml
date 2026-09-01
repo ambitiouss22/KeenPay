@@ -29,16 +29,11 @@ jobs:
         working-directory: api
         run: pip install -e ".[dev]"
 
-      - name: App boots
-        env:
-          # mirrors api/pyproject.toml's pythonpath = ["..", "."]
-          PYTHONPATH: .:api
-          JWT_SECRET: ci-secret-key-minimum-32-chars-long
-          RAZORPAY_MOCK: "true"
-          ENABLE_DEV_ROUTES: "true"
-          USE_IN_MEMORY_STORE: "true"
-        run: python -c "from api.main import app; print('app loads OK')"
-
+      # No separate "app boots" step. tests/conftest.py does
+      # `from api.main import app` at module scope, so if these tests run at
+      # all, the whole app imported cleanly. pytest resolves that through
+      # `pythonpath = ["..", "."]` in api/pyproject.toml — a hand-rolled
+      # PYTHONPATH here does NOT reproduce it and fails on `from routers ...`.
       - name: Engine unit tests
         working-directory: api
         env:
@@ -59,7 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned to the version used locally. An unpinned `pip install ruff`
+      # picks up new rules on release day and turns the gate red on its own.
+      - run: pip install ruff==0.16.5
       - name: Ruff
         working-directory: api
         run: ruff check .
