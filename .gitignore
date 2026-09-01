@@ -51,3 +51,6 @@ coverage/
 
 # Docker volumes (local)
 .deploy-data/
+
+# Local scratch / duplicate checkouts (never commit a nested copy of the repo)
+KeenPay-fresh/
