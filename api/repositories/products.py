@@ -97,16 +97,17 @@ class ProductRepository:
             clauses.append("search_vector @@ plainto_tsquery('english', :q)")
             params["q"] = q
         where = " AND ".join(clauses)
-        count_sql = text(f"SELECT COUNT(*) FROM products WHERE {where}")
+        # `where` is assembled from the hardcoded `clauses` list above; every
+        # user value is passed separately as a bound parameter (:merchant_id,
+        # :sku, :q). Nothing user-controlled reaches the SQL text.
+        count_sql = text(f"SELECT COUNT(*) FROM products WHERE {where}")  # noqa: S608  # nosec B608
         total = (await self._session.execute(count_sql, params)).scalar_one()
         sql = text(
-            f"""
-            SELECT id, sku, merchant_id, name, description, list_price_paise, cost_paise,
-                   quantity_on_hand, quantity_reserved, attributes, active,
-                   (quantity_on_hand - quantity_reserved) AS quantity_available
-            FROM products WHERE {where}
-            ORDER BY name LIMIT :limit OFFSET :offset
-            """
+            "SELECT id, sku, merchant_id, name, description, list_price_paise, cost_paise, "  # noqa: S608
+            "quantity_on_hand, quantity_reserved, attributes, active, "
+            "(quantity_on_hand - quantity_reserved) AS quantity_available "
+            f"FROM products WHERE {where} "  # nosec B608
+            "ORDER BY name LIMIT :limit OFFSET :offset"
         )
         rows = (await self._session.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows], int(total)
