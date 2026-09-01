@@ -1,0 +1,15 @@
+{
+  "annotations": { "list": [] },
+  "title": "KeenPay API Overview",
+  "uid": "keenpay-api",
+  "panels": [
+    {
+      "title": "API Up",
+      "type": "stat",
+      "targets": [{ "expr": "keenpay_up", "legendFormat": "up" }],
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 }
+    }
+  ],
+  "schemaVersion": 38,
+  "version": 1
+}
