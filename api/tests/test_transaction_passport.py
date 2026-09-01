@@ -1,10 +1,10 @@
 """Unit tests for Transaction Passport — Hash-chained audit trail."""
 
 import pytest
-from keenpay_transaction_passport import (
+from api.audit.transaction_passport import (
     PassportEngine,
-    TransactionPassport,
     PassportEntry,
+    TransactionPassport,
 )
 
 
@@ -15,9 +15,7 @@ class TestTransactionPassportEntry:
         """Create a passport entry."""
         entry = PassportEntry(
             entry_id="e1",
-            timestamp=__import__("datetime").datetime.now(
-                __import__("datetime").UTC
-            ),
+            timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
             actor="SYSTEM",
             event_type="CHECKOUT_STARTED",
             payload={"cart_items": 2},
@@ -31,7 +29,7 @@ class TestTransactionPassportEntry:
 
     def test_entry_hash_computation(self):
         """Entry hash is computed deterministically."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         now = datetime.now(UTC)
         entry = PassportEntry(
@@ -51,7 +49,7 @@ class TestTransactionPassportEntry:
 
     def test_entry_hash_unique_per_payload(self):
         """Different payloads produce different hashes."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         now = datetime.now(UTC)
         entry1 = PassportEntry(
@@ -75,7 +73,7 @@ class TestTransactionPassportEntry:
 
     def test_entry_to_dict(self):
         """Entry can be serialized to dict."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         now = datetime.now(UTC)
         entry = PassportEntry(
@@ -100,7 +98,7 @@ class TestTransactionPassport:
 
     def test_create_passport(self):
         """Create a new passport."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -116,7 +114,7 @@ class TestTransactionPassport:
 
     def test_add_single_entry(self):
         """Add an entry to passport."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -139,7 +137,7 @@ class TestTransactionPassport:
 
     def test_add_multiple_entries_creates_chain(self):
         """Multiple entries form a hash chain."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -177,7 +175,7 @@ class TestTransactionPassport:
 
     def test_passport_verification_valid_chain(self):
         """Verify intact hash chain."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -205,7 +203,7 @@ class TestTransactionPassport:
 
     def test_passport_verification_detects_tampering(self):
         """Verification detects hash tampering."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -232,11 +230,11 @@ class TestTransactionPassport:
         is_valid, errors = passport.verify()
         assert is_valid is False
         assert len(errors) > 0
-        assert "hash mismatch" in [e.lower() for e in errors]
+        assert any("hash mismatch" in e.lower() for e in errors)
 
     def test_passport_verification_detects_broken_chain(self):
         """Verification detects broken hash chain."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -263,11 +261,11 @@ class TestTransactionPassport:
         is_valid, errors = passport.verify()
         assert is_valid is False
         assert len(errors) > 0
-        assert "prior_hash" in [e.lower() for e in errors]
+        assert any("prior_hash" in e.lower() for e in errors)
 
     def test_passport_to_dict(self):
         """Passport can be serialized to dict."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -290,7 +288,7 @@ class TestTransactionPassport:
 
     def test_passport_summary(self):
         """Passport summary shows key info."""
-        from datetime import datetime, UTC
+        from datetime import UTC, datetime
 
         passport = TransactionPassport(
             passport_id="pp1",
@@ -338,7 +336,7 @@ class TestPassportEngine:
     def test_get_passport(self):
         """Engine retrieves stored passport."""
         engine = PassportEngine()
-        created = engine.create_passport("tx1", "m1")
+        created = engine.create_passport(transaction_id="tx1", merchant_id="m1")
 
         retrieved = engine.get_passport("tx1")
         assert retrieved is not None
@@ -353,7 +351,7 @@ class TestPassportEngine:
     def test_add_entry_to_passport(self):
         """Engine adds entry to existing passport."""
         engine = PassportEngine()
-        engine.create_passport("tx1", "m1")
+        engine.create_passport(transaction_id="tx1", merchant_id="m1")
 
         entry = engine.add_entry(
             transaction_id="tx1",
@@ -380,10 +378,10 @@ class TestPassportEngine:
     def test_verify_passport(self):
         """Engine verifies passport."""
         engine = PassportEngine()
-        passport = engine.create_passport("tx1", "m1")
+        passport = engine.create_passport(transaction_id="tx1", merchant_id="m1")
 
-        engine.add_entry("tx1", "SYSTEM", "START", {})
-        engine.add_entry("tx1", "USER", "CONFIRM", {})
+        engine.add_entry(transaction_id="tx1", actor="SYSTEM", event_type="START", payload={})
+        engine.add_entry(transaction_id="tx1", actor="USER", event_type="CONFIRM", payload={})
 
         is_valid, errors = engine.verify_passport("tx1")
         assert is_valid is True
@@ -399,10 +397,10 @@ class TestPassportEngine:
     def test_get_summary(self):
         """Engine retrieves passport summary."""
         engine = PassportEngine()
-        passport = engine.create_passport("tx1", "m1")
+        passport = engine.create_passport(transaction_id="tx1", merchant_id="m1")
 
-        engine.add_entry("tx1", "SYSTEM", "START", {})
-        engine.add_entry("tx1", "USER", "CONFIRM", {})
+        engine.add_entry(transaction_id="tx1", actor="SYSTEM", event_type="START", payload={})
+        engine.add_entry(transaction_id="tx1", actor="USER", event_type="CONFIRM", payload={})
 
         summary = engine.get_summary("tx1")
         assert summary is not None
@@ -423,56 +421,56 @@ class TestPassportIntegration:
         engine = PassportEngine()
 
         # Create passport
-        passport = engine.create_passport("order_123", "merchant_keen")
+        passport = engine.create_passport(transaction_id="order_123", merchant_id="merchant_keen")
 
         # Simulate checkout flow
         engine.add_entry(
-            "order_123",
-            "SYSTEM",
-            "CHECKOUT_STARTED",
-            {"cart_items": 2, "amount_paise": 9900},
+            transaction_id="order_123",
+            actor="SYSTEM",
+            event_type="CHECKOUT_STARTED",
+            payload={"cart_items": 2, "amount_paise": 9900},
         )
 
         engine.add_entry(
-            "order_123",
-            "SYSTEM",
-            "RISK_ASSESSED",
-            {"score": 0.2, "level": "LOW", "recommendation": "PROCEED"},
+            transaction_id="order_123",
+            actor="SYSTEM",
+            event_type="RISK_ASSESSED",
+            payload={"score": 0.2, "level": "LOW", "recommendation": "PROCEED"},
         )
 
         engine.add_entry(
-            "order_123",
-            "SYSTEM",
-            "AUTHORIZATION_CREATED",
-            {"auth_id": "a123", "cart_hash": "hash123", "ttl": 300},
+            transaction_id="order_123",
+            actor="SYSTEM",
+            event_type="AUTHORIZATION_CREATED",
+            payload={"auth_id": "a123", "cart_hash": "hash123", "ttl": 300},
         )
 
         engine.add_entry(
-            "order_123",
-            "AGENT",
-            "OFFER_PROPOSED",
-            {"discount_pct": 10, "final_amount_paise": 8910},
+            transaction_id="order_123",
+            actor="AGENT",
+            event_type="OFFER_PROPOSED",
+            payload={"discount_pct": 10, "final_amount_paise": 8910},
         )
 
         engine.add_entry(
-            "order_123",
-            "SYSTEM",
-            "GUARDRAIL_CHECK",
-            {"outcome": "APPROVED", "decision_id": "d123"},
+            transaction_id="order_123",
+            actor="SYSTEM",
+            event_type="GUARDRAIL_CHECK",
+            payload={"outcome": "APPROVED", "decision_id": "d123"},
         )
 
         engine.add_entry(
-            "order_123",
-            "USER",
-            "PAYMENT_CONFIRMED",
-            {"user_id": "u123"},
+            transaction_id="order_123",
+            actor="USER",
+            event_type="PAYMENT_CONFIRMED",
+            payload={"user_id": "u123"},
         )
 
         engine.add_entry(
-            "order_123",
-            "SYSTEM",
-            "PAYMENT_LINK_CREATED",
-            {"razorpay_link_id": "link123", "auth_id": "a123"},
+            transaction_id="order_123",
+            actor="SYSTEM",
+            event_type="PAYMENT_LINK_CREATED",
+            payload={"razorpay_link_id": "link123", "auth_id": "a123"},
         )
 
         # Verify complete trail

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build KeenPay database schema PDF from docs/SCHEMA.sql."""
+"""Build docs/KeenPay_Database_Schema.pdf from docs/SCHEMA.sql (canonical source)."""
 
 from pathlib import Path
 from fpdf import FPDF

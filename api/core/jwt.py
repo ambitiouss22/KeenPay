@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from config.settings import Settings, get_settings
 
@@ -44,7 +44,9 @@ class JWTManager:
         }
         if extra_claims:
             payload.update(extra_claims)
-        return jwt.encode(payload, self._settings.jwt_secret, algorithm=self._settings.jwt_algorithm)
+        return jwt.encode(
+            payload, self._settings.jwt_secret, algorithm=self._settings.jwt_algorithm
+        )
 
     def decode_access_token(self, token: str) -> TokenClaims:
         try:

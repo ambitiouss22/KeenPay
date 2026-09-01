@@ -12,7 +12,6 @@ This is what "gated" means in Track 1.
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import Optional
 from uuid import uuid4
 
 
@@ -33,7 +32,7 @@ class Authorization:
     status: str  # CREATED, AUTHORIZED, CONSUMED, EXPIRED, REVOKED
     created_at: datetime
     expires_at: datetime
-    consumed_at: Optional[datetime] = None
+    consumed_at: datetime | None = None
 
     # Security
     one_time_use: bool = True  # Can only be used once
@@ -41,10 +40,7 @@ class Authorization:
 
     def is_valid(self) -> bool:
         """Check if authorization is still valid."""
-        return (
-            self.status == "AUTHORIZED" and
-            datetime.now(UTC) < self.expires_at
-        )
+        return self.status == "AUTHORIZED" and datetime.now(UTC) < self.expires_at
 
     def is_expired(self) -> bool:
         """Check if authorization has expired."""
@@ -134,7 +130,7 @@ class AuthorizationEngine:
         auth_id: str,
         amount_paise: int,
         cart_items: list[dict],
-    ) -> tuple[bool, Optional[str]]:
+    ) -> tuple[bool, str | None]:
         """Validate authorization before payment.
 
         Args:
@@ -161,9 +157,7 @@ class AuthorizationEngine:
             return False, f"Amount mismatch: auth {auth.amount_paise}, request {amount_paise}"
 
         # Verify cart hasn't changed
-        current_cart_hash = sha256(
-            self._serialize_cart(cart_items).encode()
-        ).hexdigest()
+        current_cart_hash = sha256(self._serialize_cart(cart_items).encode()).hexdigest()
         if auth.cart_hash != current_cart_hash:
             return False, "Cart contents have been modified since authorization"
 
@@ -217,7 +211,6 @@ class AuthorizationEngine:
         Returns:
             Number of expired authorizations cleaned up
         """
-        now = datetime.now(UTC)
         expired = [
             auth_id
             for auth_id, auth in self._authorizations.items()
@@ -232,6 +225,7 @@ class AuthorizationEngine:
     def _serialize_cart(self, items: list[dict]) -> str:
         """Serialize cart for hashing (deterministic JSON)."""
         import json
+
         return json.dumps(items, sort_keys=True, separators=(",", ":"))
 
 

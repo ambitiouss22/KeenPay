@@ -9,13 +9,11 @@ Every payment journey is recorded in an immutable, tamper-evident ledger:
 This is what "explainable" means in Track 1.
 """
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Optional
 from uuid import uuid4
-import json
-import hmac
 
 
 @dataclass
@@ -25,20 +23,22 @@ class PassportEntry:
     entry_id: str  # UUID, unique within passport
     timestamp: datetime
     actor: str  # "SYSTEM", "USER", "AGENT", "POLICY_ENGINE", "PAYMENT_ENGINE", "HUMAN_APPROVER"
-    event_type: str  # "OFFER_PROPOSED", "OFFER_ACCEPTED", "GUARDRAIL_CHECK", "AUTH_CREATED", "PAYMENT_INITIATED", "PAYMENT_CONFIRMED", etc.
+    # "OFFER_PROPOSED", "OFFER_ACCEPTED", "GUARDRAIL_CHECK", "AUTH_CREATED",
+    # "PAYMENT_INITIATED", "PAYMENT_CONFIRMED", etc.
+    event_type: str
 
     # Immutable payload (what happened)
     payload: dict  # Context-specific data (offer, decision, reason, etc.)
 
     # Hash chain (proof of order and integrity)
-    prior_entry_hash: Optional[str] = None  # SHA256 of previous entry (None for first)
-    entry_hash: Optional[str] = None  # SHA256 of this entry (computed)
+    prior_entry_hash: str | None = None  # SHA256 of previous entry (None for first)
+    entry_hash: str | None = None  # SHA256 of this entry (computed)
 
     # Metadata
     session_id: str = ""
-    order_id: Optional[str] = None
-    decision_id: Optional[str] = None  # Link to guardrail decision
-    auth_id: Optional[str] = None  # Link to authorization
+    order_id: str | None = None
+    decision_id: str | None = None  # Link to guardrail decision
+    auth_id: str | None = None  # Link to authorization
 
     def compute_hash(self) -> str:
         """Compute SHA256 hash of this entry (deterministic)."""
@@ -97,9 +97,9 @@ class TransactionPassport:
         event_type: str,
         payload: dict,
         session_id: str = "",
-        order_id: Optional[str] = None,
-        decision_id: Optional[str] = None,
-        auth_id: Optional[str] = None,
+        order_id: str | None = None,
+        decision_id: str | None = None,
+        auth_id: str | None = None,
     ) -> PassportEntry:
         """Append a new entry to the passport.
 
@@ -258,7 +258,7 @@ class PassportEngine:
         self._passports[transaction_id] = passport
         return passport
 
-    def get_passport(self, transaction_id: str) -> Optional[TransactionPassport]:
+    def get_passport(self, transaction_id: str) -> TransactionPassport | None:
         """Retrieve a passport.
 
         Args:
@@ -277,10 +277,10 @@ class PassportEngine:
         event_type: str,
         payload: dict,
         session_id: str = "",
-        order_id: Optional[str] = None,
-        decision_id: Optional[str] = None,
-        auth_id: Optional[str] = None,
-    ) -> Optional[PassportEntry]:
+        order_id: str | None = None,
+        decision_id: str | None = None,
+        auth_id: str | None = None,
+    ) -> PassportEntry | None:
         """Add an entry to an existing passport.
 
         Args:
@@ -325,7 +325,7 @@ class PassportEngine:
 
         return passport.verify()
 
-    def get_summary(self, transaction_id: str) -> Optional[dict]:
+    def get_summary(self, transaction_id: str) -> dict | None:
         """Get high-level summary of a passport.
 
         Args:

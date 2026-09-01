@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build docs/KeenPay_Architecture_Workflow.pdf from the architecture spec."""
+"""Build docs/KeenPay_Architecture.pdf from docs/ARCHITECTURE.md (canonical source)."""
 
 from pathlib import Path
 from fpdf import FPDF
 
-OUTPUT = Path(__file__).resolve().parent.parent / "docs" / "KeenPay_Architecture_Workflow.pdf"
+OUTPUT = Path(__file__).resolve().parent.parent / "docs" / "KeenPay_Architecture.pdf"
 
 NAVY = (15, 23, 42)
 BLUE = (37, 99, 235)

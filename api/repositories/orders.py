@@ -97,19 +97,38 @@ class OrderRepository:
         if self._memory:
             return _MEMORY_ORDERS.get(order_id)
         assert self._session is not None
-        row = (await self._session.execute(text("SELECT * FROM orders WHERE id = :id"), {"id": order_id})).mappings().first()
+        row = (
+            (
+                await self._session.execute(
+                    text("SELECT * FROM orders WHERE id = :id"), {"id": order_id}
+                )
+            )
+            .mappings()
+            .first()
+        )
         return dict(row) if row else None
 
     async def get_by_payment_link(self, payment_link_id: str) -> dict[str, Any] | None:
         if self._memory:
-            return next((o for o in _MEMORY_ORDERS.values() if o["razorpay_payment_link_id"] == payment_link_id), None)
+            return next(
+                (
+                    o
+                    for o in _MEMORY_ORDERS.values()
+                    if o["razorpay_payment_link_id"] == payment_link_id
+                ),
+                None,
+            )
         assert self._session is not None
         row = (
-            await self._session.execute(
-                text("SELECT * FROM orders WHERE razorpay_payment_link_id = :pid"),
-                {"pid": payment_link_id},
+            (
+                await self._session.execute(
+                    text("SELECT * FROM orders WHERE razorpay_payment_link_id = :pid"),
+                    {"pid": payment_link_id},
+                )
             )
-        ).mappings().first()
+            .mappings()
+            .first()
+        )
         return dict(row) if row else None
 
     async def mark_paid(self, order_id: str, *, payment_id: str) -> dict[str, Any] | None:
@@ -123,7 +142,8 @@ class OrderRepository:
         assert self._session is not None
         await self._session.execute(
             text(
-                "UPDATE orders SET status = 'paid', razorpay_payment_id = :pid, paid_at = NOW() WHERE id = :id"
+                "UPDATE orders SET status = 'paid', razorpay_payment_id = :pid, "
+                "paid_at = NOW() WHERE id = :id"
             ),
             {"id": order_id, "pid": payment_id},
         )

@@ -26,7 +26,11 @@ def rule_max_discount(offer: ProposedOffer, policy: MerchantPolicy) -> RuleResul
 def rule_max_absolute_discount(offer: ProposedOffer, policy: MerchantPolicy) -> RuleResult:
     if offer.discount_amount_paise <= policy.max_absolute_discount_paise:
         return RuleResult(passed=True, rule_id="RULE_MAX_ABSOLUTE_DISCOUNT")
-    cap_pct = (policy.max_absolute_discount_paise / offer.subtotal_paise) * 100 if offer.subtotal_paise else 0
+    cap_pct = (
+        (policy.max_absolute_discount_paise / offer.subtotal_paise) * 100
+        if offer.subtotal_paise
+        else 0
+    )
     adjusted = _recalc_offer(offer, discount_pct=min(offer.discount_pct, cap_pct))
     return RuleResult(
         passed=False,
@@ -49,7 +53,10 @@ def rule_min_margin(offer: ProposedOffer, policy: MerchantPolicy) -> RuleResult:
                 passed=False,
                 rule_id="RULE_MIN_MARGIN",
                 action="REJECT",
-                message=f"Margin {margin_pct:.1f}% below floor {policy.min_margin_pct}% for {item.sku}",
+                message=(
+                    f"Margin {margin_pct:.1f}% below floor "
+                    f"{policy.min_margin_pct}% for {item.sku}"
+                ),
             )
     return RuleResult(passed=True, rule_id="RULE_MIN_MARGIN")
 
@@ -76,17 +83,29 @@ def rule_inventory_bounds(offer: ProposedOffer, policy: MerchantPolicy) -> RuleR
 
 def rule_price_sanity(offer: ProposedOffer, _policy: MerchantPolicy) -> RuleResult:
     if offer.final_amount_paise <= 0:
-        return RuleResult(passed=False, rule_id="RULE_PRICE_SANITY", action="REJECT", message="Invalid final amount")
+        return RuleResult(
+            passed=False,
+            rule_id="RULE_PRICE_SANITY",
+            action="REJECT",
+            message="Invalid final amount",
+        )
     for item in offer.line_items:
         unit = item.negotiated_unit_price_paise or item.list_unit_price_paise
         if unit <= 0:
-            return RuleResult(passed=False, rule_id="RULE_PRICE_SANITY", action="REJECT", message="Invalid unit price")
+            return RuleResult(
+                passed=False,
+                rule_id="RULE_PRICE_SANITY",
+                action="REJECT",
+                message="Invalid unit price",
+            )
     return RuleResult(passed=True, rule_id="RULE_PRICE_SANITY")
 
 
 def rule_currency(offer: ProposedOffer, _policy: MerchantPolicy) -> RuleResult:
     if offer.currency != "INR":
-        return RuleResult(passed=False, rule_id="RULE_CURRENCY", action="REJECT", message="INR only in v1")
+        return RuleResult(
+            passed=False, rule_id="RULE_CURRENCY", action="REJECT", message="INR only in v1"
+        )
     return RuleResult(passed=True, rule_id="RULE_CURRENCY")
 
 

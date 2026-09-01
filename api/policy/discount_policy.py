@@ -6,14 +6,13 @@ proposing discounts outside safe bounds. Implements the "bounded AI" pattern.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
-import json
 
 
 class UserType(str, Enum):
     """User segmentation for discount rules"""
+
     NEW = "new"
     RETURNING = "returning"
     VIP = "vip"
@@ -23,6 +22,7 @@ class UserType(str, Enum):
 @dataclass
 class UserSegmentDiscount:
     """Max discount for a specific user segment"""
+
     user_type: UserType
     max_discount_pct: float  # 0.0 - 100.0
     description: str = ""
@@ -35,6 +35,7 @@ class UserSegmentDiscount:
 @dataclass
 class DiscountPolicy:
     """Merchant-defined discount bounds for a product"""
+
     policy_id: str
     merchant_id: str
     product_sku: str
@@ -79,6 +80,7 @@ class DiscountPolicy:
 @dataclass
 class DiscountRequest:
     """Request to apply a discount"""
+
     merchant_id: str
     product_sku: str
     user_id: str
@@ -91,6 +93,7 @@ class DiscountRequest:
 @dataclass
 class DiscountDecision:
     """Result of discount policy check"""
+
     approved: bool
     approved_discount_pct: float  # What was actually approved
     reason: str  # Explanation for user
@@ -103,7 +106,7 @@ class DiscountDecision:
             "approved_discount_pct": self.approved_discount_pct,
             "reason": self.reason,
             "policy_applied": self.policy_applied,
-            "timestamp": self.timestamp.isoformat()
+            "timestamp": self.timestamp.isoformat(),
         }
 
 
@@ -130,11 +133,7 @@ class DiscountPolicyEngine:
 
         self._policies[policy.policy_id] = policy
 
-    def get_policy(
-        self,
-        merchant_id: str,
-        product_sku: str
-    ) -> Optional[DiscountPolicy]:
+    def get_policy(self, merchant_id: str, product_sku: str) -> DiscountPolicy | None:
         """Retrieve policy for a merchant's product"""
         for policy in self._policies.values():
             if policy.merchant_id == merchant_id and policy.product_sku == product_sku:
@@ -142,10 +141,7 @@ class DiscountPolicyEngine:
                     return policy
         return None
 
-    def check_discount_request(
-        self,
-        request: DiscountRequest
-    ) -> DiscountDecision:
+    def check_discount_request(self, request: DiscountRequest) -> DiscountDecision:
         """
         Check if requested discount is within policy bounds.
 
@@ -160,7 +156,7 @@ class DiscountPolicyEngine:
                 approved=False,
                 approved_discount_pct=0.0,
                 reason="No discount policy configured for this product",
-                policy_applied="NO_POLICY"
+                policy_applied="NO_POLICY",
             )
 
         # Step 2: Check user type limit
@@ -207,7 +203,7 @@ class DiscountPolicyEngine:
             approved=approved_discount > 0,
             approved_discount_pct=approved_discount,
             reason=reason,
-            policy_applied=policy_applied
+            policy_applied=policy_applied,
         )
 
     def reset_daily_budget(self, policy_id: str) -> None:
@@ -221,10 +217,7 @@ class DiscountPolicyEngine:
 
     def get_usage_stats(self, policy_id: str) -> dict:
         """Get discount usage stats for a policy"""
-        policy = next(
-            (p for p in self._policies.values() if p.policy_id == policy_id),
-            None
-        )
+        policy = next((p for p in self._policies.values() if p.policy_id == policy_id), None)
 
         if not policy:
             return {}
@@ -239,7 +232,9 @@ class DiscountPolicyEngine:
             "daily_budget_paise": policy.daily_budget_paise,
             "daily_used_paise": daily_used,
             "daily_remaining_paise": max(0, daily_remaining),
-            "daily_usage_pct": (daily_used / policy.daily_budget_paise * 100) if policy.daily_budget_paise > 0 else 0
+            "daily_usage_pct": (daily_used / policy.daily_budget_paise * 100)
+            if policy.daily_budget_paise > 0
+            else 0,
         }
 
 

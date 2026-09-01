@@ -8,11 +8,11 @@ Separate from Policy Engine. Returns risk score (0-1) per transaction.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class RiskLevel(str, Enum):
     """Risk categorization."""
+
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -22,6 +22,7 @@ class RiskLevel(str, Enum):
 @dataclass
 class RiskScore:
     """Risk assessment result."""
+
     score: float  # 0.0 to 1.0
     level: RiskLevel
     signals: list[str]  # Individual risk signals detected
@@ -33,11 +34,16 @@ class RiskEngine:
     """Calculates transaction risk without invoking policy."""
 
     def __init__(self):
-        """Initialize risk engine."""
-        self.injection_weight = 0.5
-        self.discount_weight = 0.3
-        self.velocity_weight = 0.2
-        self.anomaly_weight = 0.25
+        """Initialize risk engine.
+
+        Weights sum to 1.0 and express *relative* emphasis against an
+        equal-weight baseline of 0.25 per signal: a weight above 0.25
+        amplifies that signal, below 0.25 dampens it.
+        """
+        self.injection_weight = 0.30  # prompt injection is the most serious signal
+        self.discount_weight = 0.25
+        self.velocity_weight = 0.25
+        self.anomaly_weight = 0.20
 
     def score_transaction(
         self,
@@ -72,11 +78,11 @@ class RiskEngine:
         score_components["injection"] = injection_score
 
         # Signal 2: Discount anomaly
-        discount_score = self._score_discount_anomaly(
-            discount_pct, policy_max_discount
-        )
+        discount_score = self._score_discount_anomaly(discount_pct, policy_max_discount)
         if discount_score > 0.1:
-            signals.append(f"discount_anomaly (requested={discount_pct}%, max={policy_max_discount}%)")
+            signals.append(
+                f"discount_anomaly (requested={discount_pct}%, max={policy_max_discount}%)"
+            )
         score_components["discount"] = discount_score
 
         # Signal 3: Velocity (rapid requests)
@@ -91,13 +97,29 @@ class RiskEngine:
             signals.append(f"repeated_failures (attempts_today={previous_attempts_today})")
         score_components["anomaly"] = anomaly_score
 
-        # Composite score (weighted average)
-        total_score = (
-            self.injection_weight * injection_score +
-            self.discount_weight * discount_score +
-            self.velocity_weight * velocity_score +
-            self.anomaly_weight * anomaly_score
-        )
+        # Composite score: the dominant signal sets the floor, corroborating
+        # signals escalate from there.
+        #
+        # A plain weighted average is the wrong aggregation for risk. It lets
+        # one severe signal be diluted by three quiet ones, so a confirmed
+        # prompt injection scored 0.30 * 0.5 = 0.15 -> LOW -> "PROCEED".
+        # Instead:
+        #   1. Scale each signal by its emphasis (weight / 0.25 baseline).
+        #   2. Take the strongest scaled signal as the base.
+        #   3. Escalate through the remaining headroom (1 - base) according to
+        #      how much the other signals corroborate it. corr / (1 + corr)
+        #      saturates, so extra signals always raise the score but can never
+        #      reach 1.0 on their own -- only a maxed-out dominant signal can.
+        baseline = 0.25  # equal weight across the four signals
+        adjusted = {
+            "injection": min(1.0, injection_score * self.injection_weight / baseline),
+            "discount": min(1.0, discount_score * self.discount_weight / baseline),
+            "velocity": min(1.0, velocity_score * self.velocity_weight / baseline),
+            "anomaly": min(1.0, anomaly_score * self.anomaly_weight / baseline),
+        }
+        base = max(adjusted.values())
+        corroboration = sum(adjusted.values()) - base
+        total_score = base + (1.0 - base) * (corroboration / (1.0 + corroboration))
         total_score = min(1.0, max(0.0, total_score))  # Clamp 0-1
 
         # Determine level and recommendation
@@ -121,6 +143,7 @@ class RiskEngine:
             recommendation=recommendation,
             metadata={
                 "components": score_components,
+                "adjusted": adjusted,
                 "session_id": session_id,
                 "weights": {
                     "injection": self.injection_weight,
@@ -143,6 +166,7 @@ class RiskEngine:
         ]
 
         import re
+
         matches = sum(1 for p in patterns if re.search(p, text))
         return min(1.0, matches * 0.3)  # Each match adds 0.3
 

@@ -1,7 +1,7 @@
 """Unit tests for Risk Engine — Anomaly detection."""
 
 import pytest
-from keenpay_risk_engine import RiskEngine, RiskLevel
+from api.policy.risk_engine import RiskEngine, RiskLevel
 
 
 class TestRiskEngineInjectionDetection:
@@ -21,7 +21,7 @@ class TestRiskEngineInjectionDetection:
             session_id="test",
         )
         assert score.score > 0.3
-        assert "injection" in [s.lower() for s in score.signals]
+        assert any("injection" in s.lower() for s in score.signals)
 
     def test_injection_bypass_security(self):
         """Detect 'bypass security' injection."""
@@ -34,7 +34,7 @@ class TestRiskEngineInjectionDetection:
             session_id="test",
         )
         assert score.score > 0.3
-        assert "injection" in [s.lower() for s in score.signals]
+        assert any("injection" in s.lower() for s in score.signals)
 
     def test_injection_system_prompt(self):
         """Detect 'system prompt' injection."""
@@ -47,7 +47,7 @@ class TestRiskEngineInjectionDetection:
             session_id="test",
         )
         assert score.score > 0.2
-        assert "injection" in [s.lower() for s in score.signals]
+        assert any("injection" in s.lower() for s in score.signals)
 
     def test_no_injection_clean_text(self):
         """No injection for clean user input."""
@@ -92,7 +92,7 @@ class TestRiskEngineDiscountAnomaly:
             session_id="test",
         )
         assert score.metadata["components"]["discount"] == 0.2
-        assert "discount_anomaly" in [s.lower() for s in score.signals]
+        assert any("discount_anomaly" in s.lower() for s in score.signals)
 
     def test_discount_double_policy(self):
         """High anomaly when 2x policy max."""
@@ -219,7 +219,7 @@ class TestRiskEngineRepeatedFailures:
             session_id="test",
         )
         assert score.metadata["components"]["anomaly"] == 0.2
-        assert "repeated_failures" in [s.lower() for s in score.signals]
+        assert any("repeated_failures" in s.lower() for s in score.signals)
 
     def test_many_failures(self):
         """High anomaly for 7 failures."""

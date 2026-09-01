@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from config.policy import MerchantPolicy, load_merchant_policy
+from config.policy import load_merchant_policy
 from policy.anomaly import anomaly_score, detect_injection
 from policy.models import GuardrailDecision, ProposedOffer, RuleResult
 from policy.rules.evaluators import (

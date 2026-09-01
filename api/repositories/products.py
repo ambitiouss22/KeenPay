@@ -80,7 +80,9 @@ class ProductRepository:
                 items = [
                     p
                     for p in items
-                    if ql in p["name"].lower() or ql in p["sku"].lower() or ql in (p.get("description") or "").lower()
+                    if ql in p["name"].lower()
+                    or ql in p["sku"].lower()
+                    or ql in (p.get("description") or "").lower()
                 ]
             total = len(items)
             return [_enrich(p) for p in items[offset : offset + limit]], total

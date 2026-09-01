@@ -5,9 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+from config.settings import Settings, get_settings
 from core.hashing import generate_api_key, hash_token, verify_password
 from core.jwt import JWTManager
-from config.settings import Settings, get_settings
 
 
 @dataclass
@@ -38,7 +38,9 @@ class AuthService:
         repo = UserRepository()
         user = await repo.get_by_email(email=email, merchant_id=merchant_id)
         if user is None or not user.get("active"):
-            await repo.log_auth_event("login_failed", metadata={"email": email, "reason": "unknown_user"})
+            await repo.log_auth_event(
+                "login_failed", metadata={"email": email, "reason": "unknown_user"}
+            )
             raise ValueError("invalid credentials")
 
         if user.get("locked_until") and user["locked_until"] > datetime.now(UTC):
@@ -46,7 +48,9 @@ class AuthService:
 
         if not user.get("password_hash") or not verify_password(password, user["password_hash"]):
             await repo.record_failed_login(user["id"])
-            await repo.log_auth_event("login_failed", user_id=user["id"], metadata={"reason": "bad_password"})
+            await repo.log_auth_event(
+                "login_failed", user_id=user["id"], metadata={"reason": "bad_password"}
+            )
             raise ValueError("invalid credentials")
 
         await repo.clear_failed_logins(user["id"])
@@ -56,8 +60,12 @@ class AuthService:
             role=user["role"],
             auth_method="jwt",
         )
-        access, refresh = await self._issue_token_pair(principal, user_agent=user_agent, ip_address=ip_address)
-        await repo.log_auth_event("login_success", user_id=user["id"], ip_address=ip_address, user_agent=user_agent)
+        access, refresh = await self._issue_token_pair(
+            principal, user_agent=user_agent, ip_address=ip_address
+        )
+        await repo.log_auth_event(
+            "login_success", user_id=user["id"], ip_address=ip_address, user_agent=user_agent
+        )
         return access, refresh, principal
 
     async def refresh_tokens(
@@ -125,7 +133,9 @@ class AuthService:
             raise ValueError("api key expired")
 
         await repo.touch_api_key(record["id"])
-        await repo.log_auth_event("api_key_used", api_key_id=record["id"], merchant_id=record["merchant_id"])
+        await repo.log_auth_event(
+            "api_key_used", api_key_id=record["id"], merchant_id=record["merchant_id"]
+        )
         return AuthenticatedPrincipal(
             user_id=f"apikey:{record['id']}",
             merchant_id=record["merchant_id"],

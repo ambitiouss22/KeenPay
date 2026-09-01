@@ -96,16 +96,20 @@ class AuditRepository:
             )
         ).scalar_one()
         rows = (
-            await self._session.execute(
-                text(
-                    """
+            (
+                await self._session.execute(
+                    text(
+                        """
                     SELECT id::text, actor, action, decision_id::text, offer_version,
                            input_snapshot, output_snapshot, created_at
                     FROM audit_logs WHERE session_id = :sid::uuid
                     ORDER BY created_at DESC LIMIT :limit OFFSET :offset
                     """
-                ),
-                {"sid": session_id, "limit": limit, "offset": offset},
+                    ),
+                    {"sid": session_id, "limit": limit, "offset": offset},
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         return [dict(r) for r in rows], int(total)

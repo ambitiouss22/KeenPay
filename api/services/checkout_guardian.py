@@ -12,12 +12,10 @@ The Guardian ensures every payment path is:
 """
 
 from dataclasses import dataclass
-from typing import Optional
-from datetime import datetime, UTC
 
-from keenpay_risk_engine import RiskEngine, RiskScore
-from keenpay_authorization_engine import AuthorizationEngine, Authorization
-from keenpay_transaction_passport import PassportEngine, TransactionPassport
+from audit.transaction_passport import PassportEngine, TransactionPassport
+from policy.authorization_engine import Authorization, AuthorizationEngine
+from policy.risk_engine import RiskEngine, RiskScore
 
 
 @dataclass
@@ -25,9 +23,9 @@ class GuardianCheckpoint:
     """Result of a checkout guardian check."""
 
     passed: bool
-    risk_score: Optional[RiskScore] = None
-    authorization: Optional[Authorization] = None
-    passport: Optional[TransactionPassport] = None
+    risk_score: RiskScore | None = None
+    authorization: Authorization | None = None
+    passport: TransactionPassport | None = None
     errors: list[str] = None
 
     def __post_init__(self):
@@ -60,7 +58,7 @@ class CheckoutGuardian:
         *,
         session_id: str,
         merchant_id: str,
-        user_id: Optional[str],
+        user_id: str | None,
         user_text: str,
         cart_items: list[dict],
         amount_paise: int,
@@ -140,9 +138,7 @@ class CheckoutGuardian:
 
             # Check risk level
             if risk_score.recommendation == "BLOCK":
-                checkpoint.errors.append(
-                    f"High-risk transaction blocked: {risk_score.signals}"
-                )
+                checkpoint.errors.append(f"High-risk transaction blocked: {risk_score.signals}")
                 passport.add_entry(
                     actor="SYSTEM",
                     event_type="CHECKPOINT_BLOCKED",
@@ -155,9 +151,7 @@ class CheckoutGuardian:
                 return checkpoint
 
             if risk_score.recommendation == "ESCALATE":
-                checkpoint.errors.append(
-                    f"Transaction escalated for review: {risk_score.signals}"
-                )
+                checkpoint.errors.append(f"Transaction escalated for review: {risk_score.signals}")
                 passport.add_entry(
                     actor="SYSTEM",
                     event_type="CHECKPOINT_ESCALATED",
@@ -236,9 +230,9 @@ class CheckoutGuardian:
 
 
 def build_guardian(
-    risk_engine: Optional[RiskEngine] = None,
-    auth_engine: Optional[AuthorizationEngine] = None,
-    passport_engine: Optional[PassportEngine] = None,
+    risk_engine: RiskEngine | None = None,
+    auth_engine: AuthorizationEngine | None = None,
+    passport_engine: PassportEngine | None = None,
 ) -> CheckoutGuardian:
     """Factory function to build a CheckoutGuardian with default engines.
 

@@ -6,13 +6,23 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import structlog
+
 from config.settings import get_settings
 
+_log = structlog.get_logger(__name__)
 _MEMORY_TRACES: dict[str, list[dict[str, Any]]] = {}
 
 
 class TraceService:
-    async def publish(self, session_id: str, event_type: str, *, node_name: str | None = None, payload: dict | None = None) -> str:
+    async def publish(
+        self,
+        session_id: str,
+        event_type: str,
+        *,
+        node_name: str | None = None,
+        payload: dict | None = None,
+    ) -> str:
         event_id = str(uuid4())
         event = {
             "event_id": event_id,
@@ -33,7 +43,8 @@ class TraceService:
 
                 await redis.publish(f"trace:{session_id}", json.dumps(event))
             except Exception:
-                pass
+                # Best effort: a Redis hiccup must never break a checkout.
+                _log.debug("trace_publish_failed", session_id=session_id, exc_info=True)
         return event_id
 
     def get_buffer(self, session_id: str) -> list[dict[str, Any]]:

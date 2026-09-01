@@ -18,7 +18,8 @@ from services.audit import AuditService
 from services.catalog import CatalogService
 from services.razorpay import RazorpayService
 from services.trace import TraceService
-from utils.money import compute_discount_amount_paise, format_inr as fmt_inr
+from utils.money import compute_discount_amount_paise
+from utils.money import format_inr as fmt_inr
 
 
 class SessionService:
@@ -32,21 +33,34 @@ class SessionService:
         self._policy = PolicyEngine()
         self._razorpay = RazorpayService()
 
-    async def create_session(self, *, merchant_id: str, user_id: str | None, metadata: dict | None) -> dict:
-        return await self._sessions.create(merchant_id=merchant_id, user_id=user_id, metadata=metadata)
+    async def create_session(
+        self, *, merchant_id: str, user_id: str | None, metadata: dict | None
+    ) -> dict:
+        return await self._sessions.create(
+            merchant_id=merchant_id, user_id=user_id, metadata=metadata
+        )
 
     async def get_session(self, session_id: str) -> dict | None:
         return await self._sessions.get(session_id)
 
-    async def process_message(self, *, session_id: str, text: str, merchant_id: str) -> dict[str, Any]:
+    async def process_message(
+        self, *, session_id: str, text: str, merchant_id: str
+    ) -> dict[str, Any]:
         session = await self._sessions.get(session_id)
         if not session:
             raise KeenPayError("SESSION_NOT_FOUND", "Session not found")
 
-        await self._trace.publish(session_id, "graph.node.enter", node_name="parse_intent", payload={"text_len": len(text)})
+        await self._trace.publish(
+            session_id,
+            "graph.node.enter",
+            node_name="parse_intent",
+            payload={"text_len": len(text)},
+        )
 
         qty, sku_hint = self._parse_intent(text)
-        products, _ = await self._catalog.search(merchant_id=merchant_id, q=sku_hint or "hoodie", limit=5)
+        products, _ = await self._catalog.search(
+            merchant_id=merchant_id, q=sku_hint or "hoodie", limit=5
+        )
         if not products:
             return self._assistant_response(
                 session_id,
@@ -55,9 +69,13 @@ class SessionService:
 
         product = products[0]
         discount_pct = self._suggest_discount(text, session.get("negotiation_round", 0))
-        offer = self._build_offer(product, qty=qty, discount_pct=discount_pct, version=session.get("offer_version", 0) + 1)
+        offer = self._build_offer(
+            product, qty=qty, discount_pct=discount_pct, version=session.get("offer_version", 0) + 1
+        )
 
-        stock = await self._products.stock_map(merchant_id=merchant_id, skus=[p["sku"] for p in products])
+        stock = await self._products.stock_map(
+            merchant_id=merchant_id, skus=[p["sku"] for p in products]
+        )
         decision = self._policy.evaluate(
             offer=offer,
             merchant_id=merchant_id,
@@ -83,13 +101,17 @@ class SessionService:
         await self._sessions.update(
             session_id,
             proposed_offer=offer.model_dump(),
-            approved_offer=decision.approved_offer.model_dump() if decision.approved_offer else None,
+            approved_offer=decision.approved_offer.model_dump()
+            if decision.approved_offer
+            else None,
             guardrail_decision=decision.outcome,
             guardrail_decision_id=decision.decision_id,
             guardrail_detail=decision.model_dump(),
             rejection_reasons=decision.rejection_reasons,
             offer_version=offer.version,
-            final_amount_paise=decision.approved_offer.final_amount_paise if decision.approved_offer else None,
+            final_amount_paise=decision.approved_offer.final_amount_paise
+            if decision.approved_offer
+            else None,
             status="awaiting_confirmation" if decision.outcome == "APPROVED" else "negotiating",
             negotiation_round=session.get("negotiation_round", 0) + 1,
         )
@@ -98,13 +120,16 @@ class SessionService:
             reasons = "; ".join(decision.rejection_reasons) or "Policy limits apply"
             return self._assistant_response(session_id, f"I can't offer that discount. {reasons}")
         if decision.outcome == "ESCALATED":
-            return self._assistant_response(session_id, "I've escalated this to our team for review.")
+            return self._assistant_response(
+                session_id, "I've escalated this to our team for review."
+            )
 
         approved = decision.approved_offer
         assert approved is not None
         msg = (
             f"I found {product['name']} at {fmt_inr(product['list_price_paise'])} each. "
-            f"With {approved.discount_pct:.0f}% off, your total is {fmt_inr(approved.final_amount_paise)}. "
+            f"With {approved.discount_pct:.0f}% off, your total is "
+            f"{fmt_inr(approved.final_amount_paise)}. "
             "Reply confirm to pay."
         )
         return self._assistant_response(
@@ -129,7 +154,9 @@ class SessionService:
         if not session:
             raise KeenPayError("SESSION_NOT_FOUND", "Session not found")
         if session.get("guardrail_decision") != "APPROVED":
-            raise KeenPayError("GUARDRAIL_NOT_APPROVED", "Offer must pass guardrails before payment")
+            raise KeenPayError(
+                "GUARDRAIL_NOT_APPROVED", "Offer must pass guardrails before payment"
+            )
 
         approved = session.get("approved_offer")
         if not approved:
@@ -212,7 +239,9 @@ class SessionService:
             return min(10.0 + round_num * 2, 15.0)
         return 5.0
 
-    def _build_offer(self, product: dict, *, qty: int, discount_pct: float, version: int) -> ProposedOffer:
+    def _build_offer(
+        self, product: dict, *, qty: int, discount_pct: float, version: int
+    ) -> ProposedOffer:
         unit = product["list_price_paise"]
         negotiated = round(unit * (1 - discount_pct / 100))
         subtotal = negotiated * qty

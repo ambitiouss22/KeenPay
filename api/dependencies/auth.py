@@ -5,8 +5,8 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from core.rbac import Permission, require_permission
 from core.exceptions import KeenPayError
+from core.rbac import Permission, require_permission
 from services.auth import AuthenticatedPrincipal, AuthService
 
 _bearer = HTTPBearer(auto_error=False)

@@ -1,8 +1,9 @@
 """Unit tests for Authorization Engine — Scoped payment authorization."""
 
+from datetime import UTC, datetime
+
 import pytest
-from datetime import datetime, timedelta, UTC
-from keenpay_authorization_engine import AuthorizationEngine, Authorization
+from api.policy.authorization_engine import AuthorizationEngine
 
 
 class TestAuthorizationEngineCreation:
@@ -276,6 +277,7 @@ class TestAuthorizationEngineCleanup:
 
         # Wait for expiry
         import time
+
         time.sleep(1.1)
 
         # Cleanup
@@ -299,6 +301,7 @@ class TestAuthorizationEngineCleanup:
         self.engine.consume_authorization(auth.auth_id)
 
         import time
+
         time.sleep(1.1)
 
         # Cleanup

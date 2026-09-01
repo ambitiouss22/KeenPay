@@ -4,6 +4,16 @@ Bugs, wrong turns, and fixes. Newest first. If you change anything that touches 
 
 ---
 
+### 2026-08-30 — Architecture and schema doc consolidation
+
+**Symptom:** Architecture and schema knowledge was split across multiple PDFs (`KeenPay_Architecture_Workflow`, `KEENPAY_Agentic_Commerce_Architecture_V4`, `KeenPay_Database_Schema`) and a separate auth migration.  
+**Root cause:** Iterative doc generation during AegisPay → KeenPay rebrand and V4 protocol gateway design.  
+**Resolution:** Merged into `docs/ARCHITECTURE.md` (workflow + V4 protocol gateway + implementation map) and `docs/SCHEMA.sql` (DDL + auth tables + design notes). Removed superseded PDFs and `generate_aegispay_architecture_v4_pdf.py`.  
+**Prevention:** One architecture markdown, one schema SQL; PDF generators are optional exports only.  
+**Files changed:** `docs/ARCHITECTURE.md`, `docs/SCHEMA.sql`, `STRUCTURE.md`, `db/README.md`, `docs/AUTH.md`, bootstrap scripts, `Makefile`
+
+---
+
 ### 2026-08-29 — Readme schema drift
 
 **Symptom:** Early readme showed a `merchants` + `audit_ledger` sketch that did not match `SCHEMA.sql`.  
