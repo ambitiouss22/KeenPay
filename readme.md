@@ -21,20 +21,21 @@ No API keys in the model context. No `create_payment_link` tool on the agent. Pa
 ## Repo layout
 
 ```
-docs/
-  PRD.md                  product scope and acceptance criteria
-  ARCHITECTURE.md         LangGraph graph, services, data flow
-  GUARDRAILS_AND_SAFETY.md  policy rules, failure matrix, HITL
-  AI_JUDGMENT.md          what the LLM does vs what Python does
-  API_SPEC.md             REST, WebSocket, webhook contracts
-  SCHEMA.sql              PostgreSQL DDL (run this for local DB)
-  DEVELOPMENT_LOG.md      bugs and fixes as we build
-scripts/
-  generate_architecture_pdf.py
-  generate_database_schema_pdf.py
+KeenPay/
+├── api/                 # FastAPI + LangGraph backend
+├── frontend/            # Next.js — chat + trace panel
+├── workers/             # Webhook processor, hold expiry, reconciliation
+├── db/                  # Migrations + dev seeds (DDL canonical: docs/SCHEMA.sql)
+├── deploy/compose/      # Docker Compose (local, dev, CI test)
+├── tests/e2e/           # Cross-service Playwright flows
+├── docs/                # PRD, architecture, API spec, guardrails
+├── scripts/             # Bootstrap, PDF generators
+├── STRUCTURE.md         # Full directory map + layer boundaries
+├── Makefile             # dev, test, bootstrap shortcuts
+└── .env.example         # Required environment variables
 ```
 
-Implementation folders (`api/`, `frontend/`, `workers/`) are next — specs above are the source of truth until code lands.
+See **`STRUCTURE.md`** for the complete production directory map, module boundaries, and what is intentionally excluded (no AWS/cloud IaC for now).
 
 ## Checkout flow (short)
 
@@ -67,31 +68,33 @@ These are enforced in code, not in prompts:
 
 Full rule list: `docs/GUARDRAILS_AND_SAFETY.md`.
 
-## Transaction passport
-
-There is no separate passport table. Support replay is built from:
-
-`negotiation_sessions` + `orders` + `audit_logs` + `webhook_events`
-
-The UI trace panel is live; the database is what finance trusts.
-
-## Local setup (once code exists)
+## Local setup
 
 ```bash
-# database
-psql $DATABASE_URL -f docs/SCHEMA.sql
+# 1. Environment
+cp .env.example .env          # fill Razorpay test keys + OPENAI_API_KEY
 
-# backend (planned)
-cd api && uvicorn main:app --reload
+# 2. Database + seed (Windows)
+.\scripts\dev\bootstrap.ps1
 
-# frontend (planned)
-cd frontend && npm run dev
+# 3. Run services
+make dev-api                  # API on :8000
+make dev-web                  # Frontend on :3000
+
+# 4. Full checkout test (API)
+cd api && pip install -e ".[dev]"
+pytest tests/integration/test_checkout_flow.py -v
 ```
 
-Razorpay test keys go in env — never in the repo or LLM prompts.
+**Dev login:** `shopper@keenpay.dev` / `KeenPayDev1!`
+
+Open http://localhost:3000 → Start checkout session → chat + trace UI.
+
+For tests without Postgres: `USE_IN_MEMORY_STORE=true pytest`
 
 ## Docs worth reading first
 
 1. `docs/PRD.md` — what ships in v1
 2. `docs/ARCHITECTURE.md` — graph nodes and state shape
-3. `docs/AI_JUDGMENT.md` — if you are wiring the agent, read this before adding tools
+3. `STRUCTURE.md` — where code lives and layer boundaries
+4. `docs/AI_JUDGMENT.md` — if you are wiring the agent, read this before adding tools
