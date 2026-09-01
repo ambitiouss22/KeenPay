@@ -1,0 +1,5 @@
+-- Initial migration marker.
+-- Full DDL lives in docs/SCHEMA.sql (canonical).
+-- Apply with: psql $DATABASE_URL -f docs/SCHEMA.sql
+--
+-- Future deltas go here as 0002_*.sql, 0003_*.sql, etc.

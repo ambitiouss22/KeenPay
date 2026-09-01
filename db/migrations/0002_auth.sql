@@ -1,0 +1,3 @@
+-- Auth tables merged into docs/SCHEMA.sql (canonical).
+-- This file is kept as a migration marker only.
+-- Apply with: psql $DATABASE_URL -f docs/SCHEMA.sql
