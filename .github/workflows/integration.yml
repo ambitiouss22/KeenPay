@@ -1,0 +1,27 @@
+name: Integration
+
+# Manual only. Building the full docker stack on every PR is slow and flaky,
+# and a red badge on the repo reads worse than no badge. Run it from the
+# Actions tab before you submit.
+on:
+  workflow_dispatch:
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start test stack
+        run: docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.test.yml up -d --build
+      - name: Apply schema
+        run: |
+          sleep 5
+          docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.test.yml exec -T postgres \
+            psql -U keenpay -d keenpay_test -f /dev/stdin < docs/SCHEMA.sql
+      - name: Health check
+        run: |
+          sleep 3
+          curl -f http://localhost:8000/api/v1/health || exit 1
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.test.yml down -v

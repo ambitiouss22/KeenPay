@@ -1,0 +1,30 @@
+name: Web CI
+
+on:
+  push:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/web-ci.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+
+jobs:
+  lint-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          # no package-lock.json in the repo yet, so npm caching is disabled.
+          # commit a lockfile and re-enable `cache: npm` when you have one.
+      - name: Install
+        working-directory: frontend
+        run: npm install
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint --if-present
+      - name: Build
+        working-directory: frontend
+        run: npm run build
