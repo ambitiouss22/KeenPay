@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from sqlalchemy import text
@@ -111,6 +112,79 @@ class ProductRepository:
         )
         rows = (await self._session.execute(sql, params)).mappings().all()
         return [dict(r) for r in rows], int(total)
+
+    async def create(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Insert a product.
+
+        The in-memory store is a module-level list, so a write here is visible
+        to every repository instance - which is what makes the dev store behave
+        like a database rather than like per-request state.
+        """
+        if self._session is None or get_settings().use_in_memory_store:
+            _MEMORY_PRODUCTS.append(record)
+            return _enrich(record)
+
+        await self._session.execute(
+            text(
+                """
+                INSERT INTO products (
+                    id, sku, merchant_id, name, description, list_price_paise,
+                    cost_paise, quantity_on_hand, quantity_reserved, attributes, active
+                ) VALUES (
+                    :id, :sku, :merchant_id, :name, :description, :list_price_paise,
+                    :cost_paise, :quantity_on_hand, 0, CAST(:attributes AS jsonb), :active
+                )
+                """
+            ),
+            {**record, "attributes": json.dumps(record.get("attributes") or {})},
+        )
+        return _enrich(record)
+
+    async def update(
+        self,
+        *,
+        merchant_id: str,
+        sku: str,
+        changes: dict[str, Any],
+        product_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a partial update and return the stored row.
+
+        ``changes`` is filtered by the caller to a known field set; the column
+        list here is the second gate, so a key that slipped through cannot
+        become part of the statement.
+        """
+        columns = {
+            "name",
+            "description",
+            "list_price_paise",
+            "cost_paise",
+            "quantity_on_hand",
+            "attributes",
+            "active",
+        }
+        patch = {k: v for k, v in changes.items() if k in columns}
+
+        if self._session is None or get_settings().use_in_memory_store:
+            for product in _MEMORY_PRODUCTS:
+                if product["merchant_id"] == merchant_id and product["sku"] == sku:
+                    product.update(patch)
+                    return _enrich(product)
+            raise KeyError(sku)
+
+        if patch:
+            assignments = ", ".join(f"{k} = :{k}" for k in patch)
+            await self._session.execute(
+                text(
+                    f"UPDATE products SET {assignments} "  # noqa: S608  # nosec B608
+                    "WHERE merchant_id = :merchant_id AND sku = :sku"
+                ),
+                {**patch, "merchant_id": merchant_id, "sku": sku},
+            )
+        row = await self.get_by_sku(merchant_id=merchant_id, sku=sku)
+        if row is None:
+            raise KeyError(sku)
+        return row
 
     async def get_by_sku(self, *, merchant_id: str, sku: str) -> dict[str, Any] | None:
         items, _ = await self.list_products(merchant_id=merchant_id, sku=sku, limit=1, offset=0)
