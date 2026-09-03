@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from core.authorization import assert_session_visible
 from core.exceptions import KeenPayError
 from core.rbac import Permission
 from dependencies.auth import CurrentUser, require_perm
@@ -62,11 +63,11 @@ async def get_session(
     principal: CurrentUser,
     svc: SessionService = Depends(get_session_service),
 ):
-    record = await svc.get_session(session_id)
-    if not record:
-        raise HTTPException(
-            status_code=404, detail={"error": {"code": "SESSION_NOT_FOUND", "message": "Not found"}}
-        )
+    # Fetch, then authorize. The permission dependency only established that
+    # this role may read sessions in general; this establishes that it may read
+    # THIS one - same tenant, and owned by the caller unless the role may read
+    # any session in its tenant.
+    record = assert_session_visible(await svc.get_session(session_id), principal)
     return SessionOut(
         session_id=record["id"],
         status=record["status"],
@@ -89,6 +90,7 @@ async def post_message(
     principal: CurrentUser,
     svc: SessionService = Depends(get_session_service),
 ):
+    assert_session_visible(await svc.get_session(session_id), principal)
     try:
         result = await svc.process_message(
             session_id=session_id,
@@ -113,6 +115,7 @@ async def confirm_payment(
     principal: CurrentUser,
     svc: SessionService = Depends(get_session_service),
 ):
+    assert_session_visible(await svc.get_session(session_id), principal)
     if not body.confirmed:
         raise HTTPException(
             status_code=400,
@@ -144,6 +147,8 @@ async def session_audit(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     audit: AuditService = Depends(get_audit_service),
+    svc: SessionService = Depends(get_session_service),
 ):
+    assert_session_visible(await svc.get_session(session_id), principal)
     items, total = await audit.list_session_audit(session_id, limit=limit, offset=offset)
     return {"items": items, "total": total}

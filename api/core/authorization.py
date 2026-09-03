@@ -86,12 +86,53 @@ def require_same_tenant(principal_tenant: str | None, resource_tenant: str | Non
         raise _forbidden("FORBIDDEN", "Resource belongs to a different tenant")
 
 
+def assert_session_visible(session: dict | None, principal) -> dict:
+    """Return ``session`` only if this principal is entitled to see it.
+
+    Two gates, in order:
+
+    1. **Tenant.** The session must belong to the caller's merchant. Nothing a
+       role grants crosses this line.
+    2. **Ownership.** A principal holding only ``SESSION_READ_OWN`` may see
+       just its own sessions. ``SESSION_READ_ANY`` (support, manager, admin)
+       widens that to every session *inside the same tenant*.
+
+    Every refusal is a 404, never a 403. A 403 would confirm that the id names
+    a real session, which is exactly what an attacker enumerating ids wants to
+    learn. A missing session and a forbidden one must be indistinguishable.
+
+    Holding the permission is not the same as being allowed to touch a given
+    record: ``require_permission`` answers "may you read sessions at all", this
+    answers "may you read *this* one". Checking only the first is how a route
+    named READ_OWN ends up serving everybody's data.
+    """
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"error": {"code": "SESSION_NOT_FOUND", "message": "Not found"}},
+    )
+    if not session:
+        raise not_found
+
+    if session.get("merchant_id") != getattr(principal, "merchant_id", None):
+        raise not_found
+
+    if not has_permission(getattr(principal, "role", ""), Permission.SESSION_READ_ANY):
+        owner = session.get("user_id")
+        # A session with no owner is not "everyone's" - it is nobody's, and a
+        # READ_OWN principal has no claim to it.
+        if owner is None or owner != getattr(principal, "user_id", None):
+            raise not_found
+
+    return session
+
+
 def can(role: str, permission: Permission) -> bool:
     """Non-raising check, for branching rather than gating."""
     return has_permission(role, permission)
 
 
 __all__ = [
+    "assert_session_visible",
     "can",
     "require_any_permission",
     "require_permission",
