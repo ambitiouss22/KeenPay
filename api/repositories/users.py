@@ -27,6 +27,10 @@ _DEV_USERS: dict[str, dict[str, Any]] = {
         "locked_until": None,
         "failed_login_count": 0,
         "last_login_at": None,
+        # Real rows carry a tenant UUID (Phase 1). The dev store has no
+        # database to read one from, so it stays None and callers resolve the
+        # tenant from merchant_id instead.
+        "tenant_id": None,
     },
     "user_dev_support": {
         "id": "user_dev_support",
@@ -39,6 +43,10 @@ _DEV_USERS: dict[str, dict[str, Any]] = {
         "locked_until": None,
         "failed_login_count": 0,
         "last_login_at": None,
+        # Real rows carry a tenant UUID (Phase 1). The dev store has no
+        # database to read one from, so it stays None and callers resolve the
+        # tenant from merchant_id instead.
+        "tenant_id": None,
     },
     "user_dev_manager": {
         "id": "user_dev_manager",
@@ -51,6 +59,10 @@ _DEV_USERS: dict[str, dict[str, Any]] = {
         "locked_until": None,
         "failed_login_count": 0,
         "last_login_at": None,
+        # Real rows carry a tenant UUID (Phase 1). The dev store has no
+        # database to read one from, so it stays None and callers resolve the
+        # tenant from merchant_id instead.
+        "tenant_id": None,
     },
     "user_dev_admin": {
         "id": "user_dev_admin",
@@ -63,6 +75,10 @@ _DEV_USERS: dict[str, dict[str, Any]] = {
         "locked_until": None,
         "failed_login_count": 0,
         "last_login_at": None,
+        # Real rows carry a tenant UUID (Phase 1). The dev store has no
+        # database to read one from, so it stays None and callers resolve the
+        # tenant from merchant_id instead.
+        "tenant_id": None,
     },
 }
 
@@ -78,6 +94,12 @@ class UserRepository:
 
     async def get_by_id(self, user_id: str) -> dict[str, Any] | None:
         return _DEV_USERS.get(user_id)
+
+    async def update_password_hash(self, user_id: str, new_hash: str) -> None:
+        """Replace a stored hash. Used to migrate legacy hashes on login."""
+        user = _DEV_USERS.get(user_id)
+        if user:
+            user["password_hash"] = new_hash
 
     async def record_failed_login(self, user_id: str) -> None:
         user = _DEV_USERS.get(user_id)

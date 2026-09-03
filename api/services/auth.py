@@ -5,18 +5,42 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import structlog
+
 from config.settings import Settings, get_settings
-from core.hashing import generate_api_key, hash_token, verify_password
+from core.hashing import (
+    generate_api_key,
+    hash_password,
+    hash_token,
+    needs_rehash,
+    verify_password,
+)
 from core.jwt import JWTManager
+
+logger = structlog.get_logger(__name__)
+
+
+def _as_str(value: object) -> str | None:
+    """Normalise a tenant id to a string, tolerating UUID or None."""
+    return None if value is None else str(value)
 
 
 @dataclass
 class AuthenticatedPrincipal:
+    """Who the caller is, established from verified credentials only.
+
+    ``tenant_id`` is the value row-level security is pinned to. It is optional
+    because tokens issued before Phase 2 do not carry the claim; callers fall
+    back to resolving it from ``merchant_id``, which is equally token-derived
+    and so equally unspoofable.
+    """
+
     user_id: str
     merchant_id: str
     role: str
     auth_method: str  # "jwt" | "api_key"
     api_key_id: str | None = None
+    tenant_id: str | None = None
 
 
 class AuthService:
@@ -54,11 +78,23 @@ class AuthService:
             raise ValueError("invalid credentials")
 
         await repo.clear_failed_logins(user["id"])
+
+        # The plaintext only exists here, so this is the one moment a legacy
+        # bcrypt hash can be upgraded to Argon2id. Failure to persist must not
+        # fail the login — the user is already authenticated, and the old hash
+        # still works; it just gets retried on their next sign-in.
+        if needs_rehash(user["password_hash"]):
+            try:
+                await repo.update_password_hash(user["id"], hash_password(password))
+            except Exception:  # noqa: BLE001 - upgrade is best-effort
+                logger.warning("password_rehash_failed", user_id=user["id"])
+
         principal = AuthenticatedPrincipal(
             user_id=user["id"],
             merchant_id=user["merchant_id"],
             role=user["role"],
             auth_method="jwt",
+            tenant_id=_as_str(user.get("tenant_id")),
         )
         access, refresh = await self._issue_token_pair(
             principal, user_agent=user_agent, ip_address=ip_address
@@ -95,6 +131,7 @@ class AuthService:
             merchant_id=user["merchant_id"],
             role=user["role"],
             auth_method="jwt",
+            tenant_id=_as_str(user.get("tenant_id")),
         )
         access, new_refresh = await self._issue_token_pair(
             principal,
@@ -142,6 +179,7 @@ class AuthService:
             role=record["role"],
             auth_method="api_key",
             api_key_id=record["id"],
+            tenant_id=_as_str(record.get("tenant_id")),
         )
 
     async def create_api_key(
@@ -181,6 +219,7 @@ class AuthService:
             merchant_id=claims.merchant_id,
             role=claims.role,
             auth_method="jwt",
+            tenant_id=claims.tenant_id,
         )
 
     async def _issue_token_pair(
@@ -197,6 +236,7 @@ class AuthService:
             user_id=principal.user_id,
             merchant_id=principal.merchant_id,
             role=principal.role,
+            tenant_id=principal.tenant_id,
         )
         refresh_raw = self._jwt.create_refresh_token_value()
         refresh_hash = hash_token(refresh_raw)
