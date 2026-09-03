@@ -1,12 +1,37 @@
-"""PolicyEngine — synchronous guardrail evaluation (no LLM)."""
+"""PolicyEngine - synchronous guardrail evaluation (no LLM).
+
+Two entry points, one engine.
+
+``evaluate`` judges a negotiated offer: discounts, margin, inventory. It is the
+Phase 2 surface and is unchanged.
+
+``evaluate_action`` judges a financial action - a payment, refund, payout or
+campaign spend - and answers allow, escalate or deny. It is the first of the
+three Phase 5 gates, and everything that moves money passes through it before
+risk scoring and authorization.
+
+Both are deterministic and free of I/O beyond loading the merchant's policy. No
+language model is consulted on either path. A model in the approve path would
+mean the answer to "may this money move?" could differ between two identical
+requests, which is not a property a payment system may have.
+"""
 
 from __future__ import annotations
 
 from uuid import uuid4
 
-from config.policy import load_merchant_policy
+from config.policy import MerchantPolicy, load_merchant_policy
 from policy.anomaly import anomaly_score, detect_injection
-from policy.models import GuardrailDecision, ProposedOffer, RuleResult
+from policy.models import (
+    ActionRuleResult,
+    FinancialAction,
+    GuardrailDecision,
+    PolicyDecision,
+    PolicyOutcome,
+    ProposedOffer,
+    RuleResult,
+)
+from policy.rules.action_rules import ACTION_RULES
 from policy.rules.evaluators import (
     rule_currency,
     rule_inventory_bounds,
@@ -106,3 +131,70 @@ class PolicyEngine:
         if any(r.action == "REJECT" for r in results):
             return "REJECTED"
         return "APPROVED"
+
+    # --- financial actions (phase 5) ---------------------------------------
+
+    def evaluate_action(
+        self,
+        action: FinancialAction,
+        *,
+        policy: MerchantPolicy | None = None,
+    ) -> PolicyDecision:
+        """Judge one attempt to move money.
+
+        Runs every rule - not just up to the first failure. Short-circuiting
+        would be faster and would produce a decision record that names one
+        reason when there were four, which turns "fix the problem" into four
+        round trips. Cost is a handful of comparisons; the rules touch nothing.
+
+        Aggregation is deny beats escalate beats allow, unconditionally. A
+        human may approve past an *escalation*; nobody may approve past a
+        *denial*, which is the difference between the two outcomes. Aggregating
+        the other way - letting an allow anywhere soften a deny - is how a
+        gate ends up with a bypass built into its own arithmetic.
+
+        ``policy`` is injectable so tests and per-merchant overrides do not
+        have to reach through a module-level cache.
+        """
+        policy = policy or load_merchant_policy(action.merchant_id)
+
+        results: list[ActionRuleResult] = [rule(action, policy) for rule in ACTION_RULES]
+        outcome = self._aggregate_action(results)
+        reasons = [r.message for r in results if not r.passed and r.message]
+
+        return PolicyDecision(
+            decision_id=str(uuid4()),
+            outcome=outcome,
+            action_kind=action.kind,
+            amount_paise=action.amount_paise,
+            action_fingerprint=action.fingerprint(),
+            reasons=reasons,
+            rule_results=results,
+            policy_version=policy.policy_version,
+            metadata={
+                "merchant_id": action.merchant_id,
+                "actor_role": action.actor_role,
+                "subject_id": action.subject_id,
+                "rules_evaluated": len(results),
+            },
+        )
+
+    @staticmethod
+    def _aggregate_action(results: list[ActionRuleResult]) -> PolicyOutcome:
+        """Fail closed, and in a fixed order.
+
+        Written as two explicit passes rather than a max() over an ordered
+        enum. The ordering of an enum is an implementation detail that a later
+        edit can reorder without anyone noticing; this cannot be reordered by
+        accident.
+        """
+        if any(r.outcome is PolicyOutcome.DENY for r in results):
+            return PolicyOutcome.DENY
+        if any(r.outcome is PolicyOutcome.ESCALATE for r in results):
+            return PolicyOutcome.ESCALATE
+        return PolicyOutcome.ALLOW
+
+
+#: Shared instance. The engine holds no mutable state - every call reads its
+#: policy and returns a new decision - so one instance is safe across requests.
+policy_engine = PolicyEngine()
