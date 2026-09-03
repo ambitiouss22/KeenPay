@@ -61,7 +61,14 @@ async def test_app_boots_and_serves_its_schema(client):
 
 def test_router_registry_mounted_everything(app):
     mounted = app.state.mounted_routers
-    for expected in ("routers.health", "routers.auth", "routers.carts", "routers.products"):
+    for expected in (
+        "routers.health",
+        "routers.auth",
+        "routers.carts",
+        "routers.products",
+        "routers.policy",
+        "routers.authorizations",
+    ):
         assert expected in mounted, f"{expected} not mounted: {mounted}"
 
 
