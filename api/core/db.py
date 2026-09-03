@@ -8,8 +8,9 @@ engine lives in one place; this module adds the tenant-aware entry points.
 
 from __future__ import annotations
 
-from database import check_db, get_engine, get_session_factory
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from database import check_db, get_engine, get_session_factory
 
 
 def engine() -> AsyncEngine:

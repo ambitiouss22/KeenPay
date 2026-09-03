@@ -113,6 +113,68 @@ def version_of(text: str) -> str | None:
 
 # --- gates ------------------------------------------------------------------
 
+def gate_worktree_clean(allow_dirty: bool) -> None:
+    """Refuse to bless a working tree that differs from the commit.
+
+    This gate exists because of a real failure: a file was fixed locally,
+    verified green here, and then never included in the commit. CI ran the
+    commit, hit the unfixed file, and went red - after this script had said
+    "safe to push".
+
+    The lesson is that verifying a *directory* proves nothing about what CI
+    will run. CI runs what you pushed. So the check is now: is the thing I am
+    about to verify the same thing that will land?
+
+    Commit first, then verify. Use --allow-dirty for a mid-edit run, knowing
+    the result only describes your disk.
+    """
+    step("worktree vs commit")
+
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(ROOT), capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        note("not a git repo - skipping")
+        return
+
+    modified, untracked = [], []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        code, path = line[:2], line[3:].strip()
+        (untracked if code == "??" else modified).append(path)
+
+    # Untracked files are usually scratch, but a *new source file* that never
+    # gets added is the same bug wearing a different hat, so they are listed.
+    relevant_untracked = [
+        p for p in untracked
+        if p.endswith((".py", ".toml", ".yaml", ".yml", ".sql"))
+    ]
+
+    if not modified and not relevant_untracked:
+        ok("worktree matches HEAD - what is verified is what CI will run")
+        return
+
+    for p in modified:
+        print(f"{DIM}       modified:  {p}{OFF}")
+    for p in relevant_untracked:
+        print(f"{DIM}       untracked: {p}{OFF}")
+
+    to_add = " ".join(modified + relevant_untracked)
+    if allow_dirty:
+        note("worktree is dirty; results describe your disk, NOT what CI will run")
+        print(f"{DIM}       git add {to_add}{OFF}")
+        return
+
+    bad(
+        f"{len(modified) + len(relevant_untracked)} uncommitted file(s): CI runs the "
+        "commit, not your worktree. Commit them, then re-run "
+        "(or pass --allow-dirty to check your disk anyway)"
+    )
+    print(f"{DIM}       git add {to_add}{OFF}")
+
+
 def gate_ruff_version() -> str | None:
     """Reconcile the installed ruff with the pin. Returns the pinned version."""
     step("ruff version")
@@ -238,10 +300,17 @@ def main() -> int:
     ap.add_argument(
         "--lint-only", action="store_true", help="run only the version and lint gates"
     )
+    ap.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="verify the working tree even when it differs from HEAD",
+    )
     args = ap.parse_args()
 
     print(f"{DIM}repo:   {ROOT}{OFF}")
     print(f"{DIM}python: {PY}{OFF}")
+
+    gate_worktree_clean(args.allow_dirty)
 
     pinned = gate_ruff_version()
     if pinned is None:
