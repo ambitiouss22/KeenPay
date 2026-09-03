@@ -10,8 +10,12 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from config.logging import configure_logging
 from config.settings import get_settings
 from core.exceptions import KeenPayError
-from middleware.rate_limit import RateLimitMiddleware
-from middleware.request_id import RequestIDMiddleware
+from middleware.middleware import (
+    LoggingMiddleware,
+    RateLimitMiddleware,
+    RequestIDMiddleware,
+    TenantContextMiddleware,
+)
 from middleware.security_headers import SecurityHeadersMiddleware
 from routers import admin, auth, catalog, health, orders, sessions, webhooks
 
@@ -35,9 +39,16 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if settings.enable_dev_routes else None,
     )
 
-    app.add_middleware(SecurityHeadersMiddleware)
-    app.add_middleware(RequestIDMiddleware)
+    # Starlette runs the LAST-added middleware outermost, so this list reads
+    # inner-to-outer. The intended request order is:
+    #   RequestID -> TenantContext -> RateLimit -> Logging -> route
+    # TenantContext must precede RateLimit: the limiter is keyed per tenant and
+    # needs identity resolved first.
+    app.add_middleware(LoggingMiddleware)
     app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_rpm)
+    app.add_middleware(TenantContextMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,

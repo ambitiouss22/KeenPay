@@ -21,16 +21,16 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from config.settings import get_settings
-from database import get_db as _get_db
-from database import get_session_factory
-from dependencies.auth import get_current_principal
 from fastapi import Depends, HTTPException, Request, status
-from services.auth import AuthenticatedPrincipal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config.settings import get_settings
 from core.rls import set_tenant
+from database import get_db as _get_db
+from database import get_session_factory
+from dependencies.auth import get_current_principal
+from services.auth import AuthenticatedPrincipal
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -95,7 +95,14 @@ async def get_tenant_db(
     async with factory() as session:
         try:
             await session.begin()
-            tenant_id = await _resolve_tenant_id(session, principal.merchant_id)
+            # Prefer the tenant_id claim: it is signed, so it needs no lookup.
+            # Tokens issued before Phase 2 lack it, so fall back to resolving
+            # the merchant slug — also from the token, so equally trusted.
+            # Neither path consults a header; see TenantContextMiddleware.
+            if principal.tenant_id:
+                tenant_id = uuid.UUID(str(principal.tenant_id))
+            else:
+                tenant_id = await _resolve_tenant_id(session, principal.merchant_id)
             await set_tenant(session, tenant_id)
             request.state.tenant_id = tenant_id
             yield session
