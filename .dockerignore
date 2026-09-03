@@ -1,0 +1,74 @@
+# Docker build context = repo root (deploy/compose sets `context: ../..`),
+# so everything below would otherwise be shipped to the Docker daemon on
+# every build. Keep this list tight: it is the difference between a ~2 s
+# and a ~60 s build, and it keeps secrets out of the build context.
+
+# --- secrets: never in a build context ---------------------------------
+.env
+.env.local
+.env.*.local
+deploy/environments/*.env
+
+# --- version control ---------------------------------------------------
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- python ------------------------------------------------------------
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+.venv
+venv/
+env/
+build/
+dist/
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+**/.coverage
+htmlcov/
+
+# --- node / frontend ---------------------------------------------------
+**/node_modules
+frontend/.next
+frontend/out
+.turbo
+**/*.tsbuildinfo
+
+# --- tests (not needed in a runtime image) -----------------------------
+tests/
+**/tests/
+playwright-report/
+test-results/
+
+# --- docs & generated PDFs (1.2 MB of build context for nothing) -------
+docs/
+*.md
+!README.md
+
+# --- editors / OS ------------------------------------------------------
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.swp
+
+# --- local scratch -----------------------------------------------------
+KeenPay-fresh/
+.deploy-data/
+logs/
+tmp/
+*.log
+*.db
+*.sqlite3
+
+# --- docker's own files ------------------------------------------------
+# NOTE: Dockerfiles are deliberately NOT excluded. compose points at
+# `dockerfile: api/Dockerfile` inside this same context, and excluding it
+# breaks the build on some BuildKit/compose combinations. The few KB saved
+# is not worth that failure mode.
+docker-compose*.yml
+.dockerignore
