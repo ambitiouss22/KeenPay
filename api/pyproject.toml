@@ -21,6 +21,10 @@ dependencies = [
     # passlib dropped: 1.7.4 (2020, unmaintained) reads bcrypt.__about__,
     # removed in bcrypt 4.1, so it crashes on any current bcrypt.
     # core/hashing.py now calls bcrypt directly.
+    # Argon2id is the password hash (OWASP first choice; memory-hard, so GPU
+    # farms lose their advantage). bcrypt stays only to verify hashes written
+    # before the switch - core/hashing.py upgrades them on next login.
+    "argon2-cffi>=23.1.0",
     "bcrypt>=4.2.0",
     "structlog>=24.4.0",
     "prometheus-client>=0.21.0",
@@ -85,6 +89,17 @@ ignore = ["UP042"]
 "config/settings.py" = ["S104", "S105"]
 "core/jwt.py" = ["S105"]
 "schemas/auth.py" = ["S105"]
+
+[tool.ruff.lint.isort]
+# Declared explicitly, not inferred. Ruff's first-party detection changes
+# between releases: 0.15 and 0.16 sort these imports differently, so a version
+# bump alone could turn the lint gate red with no code change. Naming the
+# modules pins the classification for every version.
+known-first-party = [
+    "api", "audit", "config", "core", "database", "db", "dependencies",
+    "graph", "main", "middleware", "policy", "repositories", "routers",
+    "schemas", "services", "utils", "ws",
+]
 
 [tool.ruff.lint.flake8-bugbear]
 # FastAPI's dependency injection is designed around calls in argument defaults.
