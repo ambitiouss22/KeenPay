@@ -28,6 +28,16 @@ class Permission(str, Enum):
     API_KEY_MANAGE = "admin:api_keys"
     WEBHOOK_INTERNAL = "webhook:internal"
     DEV_SIMULATE = "dev:simulate"
+    # --- phase 5: the money gate ---
+    # Request, read and approve are three permissions rather than one, so that
+    # separation of duties is expressible: the party that asks for money to
+    # move is not the party that blesses it, and an investigator can read every
+    # record without being able to approve any of them.
+    POLICY_EVALUATE = "policy:evaluate"
+    AUTHORIZATION_REQUEST = "authorization:request"
+    AUTHORIZATION_READ = "authorization:read"
+    AUTHORIZATION_APPROVE = "authorization:approve"
+    REFUND_REQUEST = "refund:request"
 
 
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
@@ -46,6 +56,8 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.ORDER_READ_ANY,
             Permission.AUDIT_READ,
             Permission.ESCALATION_READ,
+            # Support can see why money was held, and can approve nothing.
+            Permission.AUTHORIZATION_READ,
         }
     ),
     Role.MANAGER: frozenset(
@@ -57,6 +69,12 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.ESCALATION_READ,
             Permission.ESCALATION_RESOLVE,
             Permission.ADMIN_ESCALATION,
+            Permission.POLICY_EVALUATE,
+            Permission.AUTHORIZATION_REQUEST,
+            Permission.AUTHORIZATION_READ,
+            # Manager is the lowest role that may approve money movement.
+            Permission.AUTHORIZATION_APPROVE,
+            Permission.REFUND_REQUEST,
         }
     ),
     Role.ADMIN: frozenset(Permission),
@@ -66,6 +84,13 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.SESSION_READ_ANY,
             Permission.ORDER_READ_ANY,
             Permission.AUDIT_READ,
+            # A service account may ask for an authorization and read it back.
+            # It may never approve one: an approval is a human act, and a
+            # leaked service key that could approve its own requests would
+            # make the whole gate ceremonial.
+            Permission.POLICY_EVALUATE,
+            Permission.AUTHORIZATION_REQUEST,
+            Permission.AUTHORIZATION_READ,
         }
     ),
 }
