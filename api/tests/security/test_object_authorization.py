@@ -141,4 +141,13 @@ async def test_forbidden_and_missing_are_indistinguishable(client, victim):
     fake = await client.get("/api/v1/sessions/sess_does_not_exist", headers=intruder)
 
     assert real.status_code == fake.status_code == 404
-    assert real.json() == fake.json()
+
+    # request_id is deliberately excluded: it is unique per request by design
+    # and says nothing about the resource. Everything that *could* distinguish
+    # a real id from an invented one - code, message - must match exactly.
+    def comparable(response):
+        error = dict(response.json()["error"])
+        error.pop("request_id", None)
+        return error
+
+    assert comparable(real) == comparable(fake)
