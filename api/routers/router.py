@@ -43,6 +43,8 @@ REGISTRY: list[Mount] = [
     Mount("routers.carts", description="carts and checkout (phase 4)"),
     Mount("routers.sessions", description="agentic checkout sessions"),
     Mount("routers.orders", description="orders"),
+    Mount("routers.policy", description="policy dry-run evaluation (phase 5)"),
+    Mount("routers.authorizations", description="the money gate (phase 5)"),
     Mount("routers.admin", description="escalations, policy"),
     Mount("routers.webhooks", description="razorpay callbacks"),
     Mount("routers.metrics", flag="enable_metrics", description="prometheus scrape"),
