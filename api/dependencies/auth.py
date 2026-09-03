@@ -12,6 +12,20 @@ from services.auth import AuthenticatedPrincipal, AuthService
 _bearer = HTTPBearer(auto_error=False)
 
 
+def _publish(request: Request, principal: AuthenticatedPrincipal) -> None:
+    """Mirror the verified principal onto request.state.
+
+    Middleware already set these from the token; writing them again keeps the
+    two paths consistent when a request authenticates by API key, which the
+    middleware does not decode.
+    """
+    request.state.principal = principal
+    request.state.tenant_id = principal.tenant_id
+    request.state.merchant_id = principal.merchant_id
+    request.state.user_id = principal.user_id
+    request.state.role = principal.role
+
+
 def get_auth_service() -> AuthService:
     return AuthService()
 
@@ -25,7 +39,7 @@ async def get_current_principal(
     if credentials and credentials.scheme.lower() == "bearer":
         try:
             principal = auth_service.verify_access_token(credentials.credentials)
-            request.state.principal = principal
+            _publish(request, principal)
             return principal
         except ValueError as exc:
             raise HTTPException(
@@ -36,7 +50,7 @@ async def get_current_principal(
     if x_api_key:
         try:
             principal = await auth_service.authenticate_api_key(x_api_key)
-            request.state.principal = principal
+            _publish(request, principal)
             return principal
         except ValueError as exc:
             raise HTTPException(
