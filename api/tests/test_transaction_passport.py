@@ -1,6 +1,7 @@
 """Unit tests for Transaction Passport — Hash-chained audit trail."""
 
 import pytest
+
 from api.audit.transaction_passport import (
     PassportEngine,
     PassportEntry,
