@@ -6,6 +6,8 @@ from config.settings import get_settings
 from core.rbac import Permission
 from dependencies.auth import CurrentUser, get_auth_service, require_perm
 from schemas.auth import (
+    AgentTokenRequest,
+    AgentTokenResponse,
     ApiKeyCreateRequest,
     ApiKeyCreateResponse,
     LoginRequest,
@@ -142,4 +144,54 @@ async def create_api_key(
         prefix=record["key_prefix"],
         role=record["role"],
         expires_at=record.get("expires_at"),
+    )
+
+
+@router.post(
+    "/agent-tokens",
+    response_model=AgentTokenResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_perm(Permission.API_KEY_MANAGE))],
+)
+async def create_agent_token(
+    body: AgentTokenRequest,
+    principal: CurrentUser,
+    auth: AuthService = Depends(get_auth_service),
+) -> AgentTokenResponse:
+    """Mint a short-lived, audience-restricted credential for an AI agent.
+
+    Gated behind the same permission as API keys, because that is what this
+    is: a machine credential, and handing one out is an administrative act.
+
+    The merchant is taken from the caller's own token and the role is fixed at
+    ``agent`` server-side. An operator can therefore only ever mint a
+    credential for their own merchant, and never one that can approve, refund
+    or capture - no combination of request fields reaches those permissions.
+
+    The token is returned once and not stored. It is short-lived by design, so
+    the recovery path for a lost one is to mint another rather than to keep a
+    long-lived secret somewhere it can be read.
+    """
+    try:
+        token, ttl, granted = auth.issue_agent_token(
+            agent_id=body.agent_id,
+            merchant_id=principal.merchant_id,
+            scopes=body.scopes,
+            issued_by=principal.user_id,
+            tenant_id=principal.tenant_id,
+            ttl_seconds=body.ttl_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": {"code": "INVALID_AGENT_SCOPE", "message": str(exc)}},
+        ) from exc
+
+    return AgentTokenResponse(
+        access_token=token,
+        expires_in=ttl,
+        audience=get_settings().control_plane_audience,
+        scopes=granted,
+        merchant_id=principal.merchant_id,
+        agent_id=body.agent_id,
     )
