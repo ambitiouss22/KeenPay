@@ -149,6 +149,44 @@ async def test_bearer_token_is_sent(agent_token, ai_settings):
     assert seen["x-agent-runtime"] == "keenpay-ai-runtime"
 
 
+async def test_no_correlation_id_means_no_header(agent_token, ai_settings, control_plane):
+    """The Control Plane generates its own id when none is offered."""
+    client = ControlPlaneClient(
+        credential=AgentCredential.parse(agent_token),
+        settings=ai_settings,
+        client=httpx.AsyncClient(
+            base_url=ai_settings.control_plane_url, transport=control_plane.transport()
+        ),
+    )
+    await client.call("list_products")
+    await client.aclose()
+    # httpx lower-cases header names, so assert on the lower-cased key.
+    assert "x-request-id" not in control_plane.headers[0]
+
+
+async def test_the_correlation_id_is_sent_on_every_call(agent_token, ai_settings):
+    """One run, one id - otherwise its calls are unrelated lines in the trail."""
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-request-id"))
+        return httpx.Response(200, json={"items": []})
+
+    client = ControlPlaneClient(
+        credential=AgentCredential.parse(agent_token),
+        settings=ai_settings,
+        client=httpx.AsyncClient(
+            base_url=ai_settings.control_plane_url, transport=httpx.MockTransport(handler)
+        ),
+        correlation_id="run_abcdef0123456789",
+    )
+    await client.call("list_products")
+    await client.call("get_product", path_params={"sku": "X"})
+    await client.aclose()
+
+    assert seen == ["run_abcdef0123456789", "run_abcdef0123456789"]
+
+
 async def test_writes_are_not_retried(agent_token, ai_settings):
     """A retried POST is how one authorization request becomes two approvals."""
     attempts = {"n": 0}

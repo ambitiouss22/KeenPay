@@ -60,6 +60,16 @@ class AIRuntimeSettings(BaseSettings):
 
     #: Optional default credential for local runs. In deployment the token
     #: arrives per request instead, which keeps its lifetime short.
+    #:
+    #: Credentials are minted by the Control Plane, which holds the signing key
+    #: this service deliberately does not::
+    #:
+    #:     POST /api/v1/auth/agent-tokens  {"agent_id": ..., "scopes": [...]}
+    #:
+    #: It answers with a token whose role is ``agent``, whose audience is the
+    #: value below, and whose scopes are a subset of what an agent may ever
+    #: hold. Capture, refund and approve are not among them, and asking for one
+    #: is refused rather than quietly dropped.
     agent_token: str = ""
 
     #: Ceilings on a single run, so a looping plan costs bounded time and a

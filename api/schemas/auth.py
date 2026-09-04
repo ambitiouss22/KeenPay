@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class LoginRequest(BaseModel):
@@ -44,6 +44,41 @@ class ApiKeyCreateRequest(BaseModel):
     role: Literal["service", "admin"] = "service"
     scopes: list[str] = Field(default_factory=list)
     expires_in_days: int | None = Field(default=90, ge=1, le=365)
+
+
+class AgentTokenRequest(BaseModel):
+    """Ask for a short-lived credential for an AI agent.
+
+    There is no ``merchant_id`` and no ``role``. Both are decided by the
+    server: the merchant comes from the requesting operator's own token, and
+    the role is always ``agent``. A body that could name either would let an
+    operator mint a credential for another merchant, or an agent credential
+    that could approve its own requests.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str = Field(min_length=1, max_length=128)
+    scopes: list[str] = Field(min_length=1, max_length=16)
+    ttl_seconds: int | None = Field(default=None, ge=60, le=3600)
+
+
+class AgentTokenResponse(BaseModel):
+    """The credential, plus exactly what it is allowed to do.
+
+    ``scopes`` is echoed back as granted rather than as requested, so a caller
+    can see what it actually received instead of assuming it got what it asked
+    for.
+    """
+
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    audience: str
+    role: Literal["agent"] = "agent"
+    scopes: list[str]
+    merchant_id: str
+    agent_id: str
 
 
 class ApiKeyCreateResponse(BaseModel):

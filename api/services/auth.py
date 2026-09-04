@@ -30,9 +30,9 @@ class AuthenticatedPrincipal:
     """Who the caller is, established from verified credentials only.
 
     ``tenant_id`` is the value row-level security is pinned to. It is optional
-    because tokens issued before Phase 2 do not carry the claim; callers fall
-    back to resolving it from ``merchant_id``, which is equally token-derived
-    and so equally unspoofable.
+    because tokens issued by an earlier version do not carry the claim; callers
+    fall back to resolving it from ``merchant_id``, which is equally
+    token-derived and so equally unspoofable.
     """
 
     user_id: str
@@ -41,6 +41,12 @@ class AuthenticatedPrincipal:
     auth_method: str  # "jwt" | "api_key"
     api_key_id: str | None = None
     tenant_id: str | None = None
+    #: Set only for a scoped credential. ``None`` means the role alone decides
+    #: what the caller may do; a set narrows it. Never widens it - see
+    #: ``core.rbac.effective_permissions``.
+    scopes: frozenset[str] | None = None
+    #: The audience the presented token named, when it named one.
+    audience: str | None = None
 
 
 class AuthService:
@@ -214,13 +220,86 @@ class AuthService:
 
     def verify_access_token(self, token: str) -> AuthenticatedPrincipal:
         claims = self._jwt.decode_access_token(token)
+        if claims.audiences and self._settings.control_plane_audience not in claims.audiences:
+            # A token minted for another service must not be replayable here,
+            # even when it is correctly signed. Tokens with no audience are
+            # ordinary user tokens and stay unaffected.
+            raise ValueError("token was not issued for this service")
         return AuthenticatedPrincipal(
             user_id=claims.sub,
             merchant_id=claims.merchant_id,
             role=claims.role,
             auth_method="jwt",
             tenant_id=claims.tenant_id,
+            scopes=claims.scopes,
+            audience=claims.audiences[0] if claims.audiences else None,
         )
+
+    def issue_agent_token(
+        self,
+        *,
+        agent_id: str,
+        merchant_id: str,
+        scopes: list[str],
+        issued_by: str,
+        tenant_id: str | None = None,
+        ttl_seconds: int | None = None,
+    ) -> tuple[str, int, list[str]]:
+        """Mint a short-lived, audience-restricted credential for an AI agent.
+
+        Three properties, and each exists because of a specific failure it
+        prevents.
+
+        *Short-lived.* The default life is minutes, not the hour an interactive
+        session gets. An agent credential lives in a separate container whose
+        whole job is to process untrusted text; the window in which a leaked one
+        is useful should be small enough that noticing the leak still helps.
+
+        *Audience-restricted.* It names this service, so it cannot be replayed
+        against another one that happens to trust the same signing key.
+
+        *Least privilege.* The role is ``agent``, which cannot approve, refund
+        or capture anything, and the scopes narrow it further. A scope outside
+        :data:`AGENT_GRANTABLE_SCOPES` is refused rather than dropped, so an
+        operator asking for something impossible is told, not quietly given
+        less than they asked for.
+        """
+        from core.rbac import AGENT_GRANTABLE_SCOPES, Role
+
+        requested = [s.strip() for s in scopes if s and s.strip()]
+        if not requested:
+            raise ValueError("at least one scope is required")
+
+        unknown = sorted(set(requested) - AGENT_GRANTABLE_SCOPES)
+        if unknown:
+            raise ValueError(f"scope(s) not grantable to an agent: {', '.join(unknown)}")
+
+        ttl = ttl_seconds or self._settings.agent_token_ttl_seconds
+        if ttl < 60 or ttl > self._settings.agent_token_max_ttl_seconds:
+            raise ValueError(
+                f"ttl_seconds must be between 60 and "
+                f"{self._settings.agent_token_max_ttl_seconds}"
+            )
+
+        granted = sorted(set(requested))
+        token = self._jwt.create_access_token(
+            user_id=agent_id,
+            merchant_id=merchant_id,
+            role=Role.AGENT.value,
+            tenant_id=tenant_id,
+            expires_delta=timedelta(seconds=ttl),
+            audience=self._settings.control_plane_audience,
+            scopes=granted,
+        )
+        logger.info(
+            "agent_token_issued",
+            agent_id=agent_id,
+            merchant_id=merchant_id,
+            issued_by=issued_by,
+            scopes=granted,
+            ttl_seconds=ttl,
+        )
+        return token, ttl, granted
 
     async def _issue_token_pair(
         self,

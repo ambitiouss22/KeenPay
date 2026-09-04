@@ -185,6 +185,8 @@ class StubControlPlane:
         #: can assert on what was actually sent rather than on what a helper
         #: says was sent.
         self.bodies: list[tuple[str, dict[str, Any]]] = []
+        #: Request headers, in order, so a test can assert on correlation.
+        self.headers: list[dict[str, str]] = []
         self.authorization_status = authorization_status
         self.carts: dict[str, list[dict[str, Any]]] = {}
         self._cart_seq = 0
@@ -207,6 +209,7 @@ class StubControlPlane:
         # make an escaped, harmless request look like a payment call - the
         # opposite of what the encoding achieved.
         self.requests.append((method, request.url.raw_path.decode().split("?", 1)[0]))
+        self.headers.append(dict(request.headers))
         if request.content:
             try:
                 self.bodies.append((path, json.loads(request.content)))

@@ -27,6 +27,16 @@ class Settings(BaseSettings):
     jwt_access_expire_minutes: int = 60
     jwt_refresh_expire_days: int = 7
 
+    # The name this service answers to in a token's ``aud`` claim. A credential
+    # minted for anything else is refused even when correctly signed, so one
+    # leaking sideways from another service cannot be replayed here.
+    control_plane_audience: str = "keenpay-control-plane"
+    # Agent credentials are deliberately short-lived. They live in a container
+    # whose whole job is processing untrusted text, so the window in which a
+    # leaked one is useful should be small enough that noticing still helps.
+    agent_token_ttl_seconds: int = 900
+    agent_token_max_ttl_seconds: int = 3600
+
     openai_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: int = 10
@@ -35,6 +45,20 @@ class Settings(BaseSettings):
     razorpay_key_secret: str = ""
     razorpay_webhook_secret: str = ""
     razorpay_mock: bool = True
+
+    # Passports are signed with this when set, and with jwt_secret when not.
+    # Separate settings on purpose: a passport must stay verifiable for years,
+    # long after the JWT secret should have been rotated, so tying them
+    # together would force a choice between rotating tokens and keeping old
+    # receipts checkable.
+    passport_signing_key: str = ""
+
+    # How often the reconciliation loop asks the provider about payments stuck
+    # in UNKNOWN, and how many it examines per pass. Bounded so a backlog
+    # drains steadily rather than one pass hammering the provider.
+    reconciliation_interval_seconds: int = 300
+    reconciliation_batch_size: int = 100
+    webhook_retry_interval_seconds: int = 60
 
     merchant_policy_json: str = "./api/config/merchant_policy.json"
 

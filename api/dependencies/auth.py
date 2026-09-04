@@ -88,7 +88,11 @@ def require_perm(permission: Permission):
         principal: Annotated[AuthenticatedPrincipal, Depends(get_current_principal)],
     ) -> AuthenticatedPrincipal:
         try:
-            require_permission(principal.role, permission)
+            # Scopes are passed through, so a scoped credential is checked
+            # against the intersection of its role and its scopes. Passing
+            # ``None`` for an unscoped principal keeps every existing caller
+            # behaving exactly as before.
+            require_permission(principal.role, permission, principal.scopes)
         except KeenPayError as exc:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
