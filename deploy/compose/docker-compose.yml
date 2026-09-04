@@ -37,11 +37,42 @@ services:
       - "8000:8000"
     env_file:
       - ../../.env
+    networks:
+      # Joins the agent network so the runtime can reach it, and the default
+      # one so it can reach Postgres and Redis. The runtime is on `agent`
+      # only, which is what keeps the datastores off its network entirely.
+      - default
+      - agent
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  # The reasoning service. What it is NOT given is the specification:
+  #   * no env_file - it never sees DATABASE_URL, JWT_SECRET or a Razorpay key
+  #   * no depends_on postgres/redis - it has no client for either
+  #   * its own network, attached to the API alone, so its egress is the
+  #     Control Plane and nothing else on the compose network
+  # Its entire configuration is where the Control Plane is and what its own
+  # per-run limits are.
+  ai-runtime:
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile.ai
+    ports:
+      - "8100:8100"
+    environment:
+      AI_APP_ENV: ${APP_ENV:-development}
+      AI_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      AI_CONTROL_PLANE_URL: http://api:8000
+      AI_AGENT_AUDIENCE: keenpay-control-plane
+      AI_MAX_TOOL_CALLS: "12"
+      AI_MAX_REQUEST_AMOUNT_PAISE: "5000000"
+    networks:
+      - agent
+    depends_on:
+      - api
 
   worker:
     build:
@@ -65,6 +96,13 @@ services:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     depends_on:
       - api
+
+networks:
+  default:
+  # Carries exactly two members: the Control Plane and the AI Runtime. The
+  # runtime therefore has no route to Postgres or Redis at the network layer,
+  # independent of what its code does or does not import.
+  agent:
 
 volumes:
   pgdata:

@@ -1,0 +1,65 @@
+# KeenPay AI Runtime image.
+#
+# A separate image from the Control Plane, not a second entrypoint on the same
+# one. Sharing an image would mean this container carried the payment service,
+# the database models and the Razorpay client - dormant, but present, and one
+# import away from being used. Building only what the runtime needs is what
+# makes "the AI cannot reach the database" a property of the artefact rather
+# than a property of how it happens to be invoked.
+#
+# Build context is the REPO ROOT (deploy/compose sets `context: ../..`), which
+# is why the COPY lines are prefixed with `api/`.
+
+# --- stage 1: build dependencies ---------------------------------------
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Only what the reasoning service uses. Notably absent, and deliberately:
+# asyncpg, SQLAlchemy, redis - there is no database for this service to reach -
+# and any payment SDK.
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir \
+        "fastapi>=0.115.0" \
+        "uvicorn[standard]>=0.32.0" \
+        "pydantic>=2.9.0" \
+        "pydantic-settings>=2.6.0" \
+        "httpx>=0.28.0" \
+        "langgraph>=0.2.0" \
+        "structlog>=24.4.0"
+
+# --- stage 2: runtime --------------------------------------------------
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Only the runtime package and the two modules it needs to be a Python
+# package root. The Control Plane's routers, services and repositories are not
+# copied: code that is not in the image cannot be imported by accident.
+COPY api/ai_runtime/ /app/ai_runtime/
+
+RUN useradd -m -u 1000 keenagent && chown -R keenagent:keenagent /app
+USER keenagent
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    AI_PORT=8100
+
+EXPOSE 8100
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD curl -f http://localhost:8100/health/live || exit 1
+
+CMD ["uvicorn", "ai_runtime.main:app", "--host", "0.0.0.0", "--port", "8100"]

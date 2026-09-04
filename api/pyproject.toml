@@ -87,6 +87,9 @@ ignore = ["UP042"]
 "services/session.py" = ["S101"]
 # Field defaults on a Settings model, not real credentials.
 "config/settings.py" = ["S104", "S105"]
+# Same reason as config/settings.py: a bind address default on a settings
+# model, not a credential.
+"ai_runtime/config.py" = ["S104", "S105"]
 "core/jwt.py" = ["S105"]
 "schemas/auth.py" = ["S105"]
 
@@ -96,9 +99,9 @@ ignore = ["UP042"]
 # bump alone could turn the lint gate red with no code change. Naming the
 # modules pins the classification for every version.
 known-first-party = [
-    "api", "audit", "config", "core", "database", "db", "dependencies",
-    "graph", "main", "middleware", "policy", "repositories", "routers",
-    "schemas", "services", "utils", "ws",
+    "ai_runtime", "api", "audit", "config", "core", "database", "db",
+    "dependencies", "graph", "main", "middleware", "policy", "repositories",
+    "routers", "schemas", "services", "utils", "ws",
 ]
 
 [tool.ruff.lint.flake8-bugbear]
