@@ -218,9 +218,17 @@ class ControlPlaneClient:
         settings: AIRuntimeSettings | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         client: httpx.AsyncClient | None = None,
+        correlation_id: str | None = None,
     ) -> None:
         self._settings = settings or get_ai_settings()
         self._credential = credential
+        #: Sent as ``X-Request-ID`` on every call, so the Control Plane stamps
+        #: one run's requests with one id. Without it each call gets a fresh
+        #: server-side id, and the five requests behind a single purchase
+        #: become five unrelated lines in the audit trail - which makes the
+        #: first question an investigator asks ("what did this run do?")
+        #: unanswerable.
+        self._correlation_id = correlation_id
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             base_url=self._settings.control_plane_url.rstrip("/"),
@@ -288,6 +296,8 @@ class ControlPlaneClient:
             # request is worth being able to pick out of an audit trail later.
             "X-Agent-Runtime": "keenpay-ai-runtime",
         }
+        if self._correlation_id:
+            headers["X-Request-ID"] = self._correlation_id
 
         attempts = max(1, self._settings.control_plane_max_retries + 1)
         last_exc: Exception | None = None

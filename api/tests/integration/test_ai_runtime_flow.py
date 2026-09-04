@@ -141,6 +141,14 @@ async def test_runtime_ceiling_stops_an_oversized_request(
     assert any("ceiling" in e for e in report.errors)
 
 
+async def test_every_call_in_a_run_carries_the_run_id(runner, control_plane, agent_token):
+    """One run is one traceable unit in the Control Plane's own audit trail."""
+    report = await runner.run(message="buy me green tea", agent_token=agent_token)
+
+    sent = {headers.get("x-request-id") for headers in control_plane.headers}
+    assert sent == {report.run_id}
+
+
 async def test_the_run_report_lists_every_control_plane_call(
     runner, control_plane, agent_token
 ):

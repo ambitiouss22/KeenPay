@@ -131,6 +131,10 @@ class AgentRunner:
             settings=self._settings,
             transport=self._transport,
             client=self._http_client,
+            # The run id doubles as the correlation id, so every Control Plane
+            # request this run makes carries it and the whole run can be pulled
+            # out of the audit trail by one value.
+            correlation_id=rid,
         )
         registry = ToolRegistry(client, max_calls=self._settings.max_tool_calls)
 
