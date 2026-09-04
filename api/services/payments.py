@@ -15,6 +15,7 @@ state and reconciliation resolves it.
 
 from typing import Any
 
+from modules.audit.ledger import AuditLedger
 from modules.idempotency.service import IdempotencyService, IdempotencyVerdict
 from modules.payments.interface import ProviderError, ProviderTimeout
 from modules.payments.provider import get_provider
@@ -43,12 +44,39 @@ class PaymentService:
         orders: OrderRepository | None = None,
         idempotency: IdempotencyService | None = None,
         outbox: OutboxRepository | None = None,
+        ledger: AuditLedger | None = None,
     ):
         self._provider = provider or get_provider()
         self._payments = payments or PaymentRepository()
         self._orders = orders or OrderRepository()
         self._idempotency = idempotency or IdempotencyService()
         self._outbox = outbox or OutboxRepository()
+        self._ledger = ledger or AuditLedger()
+
+    async def _record(
+        self,
+        merchant_id: str,
+        payment_id: str,
+        action: str,
+        payload: dict[str, Any],
+        *,
+        correlation_id: str | None = None,
+    ) -> None:
+        """Write one step of a payment's life into the audit chain.
+
+        Every outcome is recorded, not only the successful ones. A trail that
+        omits the refusals and the timeouts cannot answer the question actually
+        asked in a dispute, which is why money did *not* move.
+        """
+        await self._ledger.append(
+            merchant_id=merchant_id,
+            entity_type="payment",
+            entity_id=payment_id,
+            actor="payment_engine",
+            action=action,
+            payload=payload,
+            correlation_id=correlation_id,
+        )
 
     # --- create -------------------------------------------------------------
 
@@ -107,6 +135,19 @@ class PaymentService:
             order_snapshot_hash=order_hash,
         )
         payment_id = payment["id"]
+        await self._record(
+            merchant_id,
+            payment_id,
+            "PAYMENT_CREATED",
+            {
+                "order_id": order_id,
+                "amount_paise": amount_paise,
+                "currency": currency,
+                "authorization_id": authorization_id,
+                "order_snapshot_hash": order_hash,
+            },
+            correlation_id=idempotency_key,
+        )
 
         try:
             created = await self._provider.create_order(
@@ -120,6 +161,12 @@ class PaymentService:
                 "create_order",
                 provider_payment_id=created.provider_payment_id,
                 provider_raw_status=created.raw_status,
+            )
+            # Persist the provider's id before the capture is attempted. If the
+            # capture times out, this is the only handle reconciliation has for
+            # asking what actually happened.
+            await self._payments.set_provider_reference(
+                payment_id, created.provider_payment_id
             )
             await self._payments.transition(
                 payment_id, {PaymentState.CREATED}, PaymentState.AUTH_REQUIRED
@@ -148,6 +195,13 @@ class PaymentService:
                 {PaymentState.CREATED, PaymentState.AUTH_REQUIRED, PaymentState.AUTHORIZED},
                 PaymentState.UNKNOWN,
             )
+            await self._record(
+                merchant_id,
+                payment_id,
+                "PAYMENT_UNKNOWN",
+                {"reason": "provider_timeout", "order_id": order_id},
+                correlation_id=idempotency_key,
+            )
             return _error(502, "PROVIDER_UNKNOWN", "Provider did not answer; payment is UNKNOWN")
         except ProviderError as exc:
             await self._payments.record_attempt(payment_id, "capture", error=str(exc))
@@ -156,12 +210,30 @@ class PaymentService:
                 {PaymentState.CREATED, PaymentState.AUTH_REQUIRED, PaymentState.AUTHORIZED},
                 PaymentState.FAILED,
             )
+            await self._record(
+                merchant_id,
+                payment_id,
+                "PAYMENT_FAILED",
+                {"code": exc.code, "message": exc.message, "order_id": order_id},
+                correlation_id=idempotency_key,
+            )
             await self._idempotency.release(merchant_id, CREATE_ENDPOINT, idempotency_key)
             return _error(402, exc.code, exc.message or "Provider refused the payment")
 
         if captured.state is not PaymentState.CAPTURED:
             await self._payments.transition(
                 payment_id, {PaymentState.AUTHORIZED}, PaymentState.UNKNOWN
+            )
+            await self._record(
+                merchant_id,
+                payment_id,
+                "PAYMENT_UNKNOWN",
+                {
+                    "reason": "unrecognised_provider_status",
+                    "provider_raw_status": captured.raw_status,
+                    "order_id": order_id,
+                },
+                correlation_id=idempotency_key,
             )
             return _error(502, "PROVIDER_UNKNOWN", "Provider returned an unrecognised status")
 
@@ -175,6 +247,17 @@ class PaymentService:
             payment_id,
             "payment.captured",
             {"payment_id": payment_id, "order_id": order_id, "amount_paise": amount_paise},
+        )
+        await self._record(
+            merchant_id,
+            payment_id,
+            "PAYMENT_CAPTURED",
+            {
+                "order_id": order_id,
+                "amount_paise": amount_paise,
+                "provider_payment_id": captured.provider_payment_id,
+            },
+            correlation_id=idempotency_key,
         )
 
         body = self._to_out(record)
@@ -299,6 +382,17 @@ class PaymentService:
             payment_id,
             "payment.refunded",
             {"payment_id": payment_id, "amount_paise": amount_paise},
+        )
+        await self._record(
+            merchant_id,
+            payment_id,
+            "PAYMENT_REFUNDED",
+            {
+                "amount_paise": amount_paise,
+                "refunded_total_paise": int(record["refunded_paise"]) if record else None,
+                "authorization_id": authorization_id,
+            },
+            correlation_id=idempotency_key,
         )
 
         body = self._to_out(record)

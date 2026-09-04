@@ -36,6 +36,20 @@ class Settings(BaseSettings):
     razorpay_webhook_secret: str = ""
     razorpay_mock: bool = True
 
+    # Passports are signed with this when set, and with jwt_secret when not.
+    # Separate settings on purpose: a passport must stay verifiable for years,
+    # long after the JWT secret should have been rotated, so tying them
+    # together would force a choice between rotating tokens and keeping old
+    # receipts checkable.
+    passport_signing_key: str = ""
+
+    # How often the reconciliation loop asks the provider about payments stuck
+    # in UNKNOWN, and how many it examines per pass. Bounded so a backlog
+    # drains steadily rather than one pass hammering the provider.
+    reconciliation_interval_seconds: int = 300
+    reconciliation_batch_size: int = 100
+    webhook_retry_interval_seconds: int = 60
+
     merchant_policy_json: str = "./api/config/merchant_policy.json"
 
     enable_dev_routes: bool = True
