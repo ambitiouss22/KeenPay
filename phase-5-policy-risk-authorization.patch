@@ -1,0 +1,4685 @@
+From a70b87e877fb1278d4ef13c99ab03c8e23fd90f6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 1/6] feat(policy): deterministic allow/escalate/deny gate for
+ financial actions
+
+Adds the action-shaped half of the policy engine alongside the existing
+offer-shaped one. FinancialAction describes a payment, refund, payout or
+campaign spend completely enough to judge without reading a clock or a
+database, so a disputed decision can be replayed months later and come out
+the same.
+
+Nine pure rules: currency, positive amount, actor matrix, per-kind ceiling,
+per-kind escalation threshold, refund-within-capture, daily cap, velocity and
+geography. Every rule reports even when it passes - a record listing only
+failures cannot prove the cap was checked at all.
+
+Aggregation is deny beats escalate beats allow, written as two explicit passes
+rather than a max() over an enum whose ordering a later edit could silently
+reverse. A human may approve past an escalation; nobody may approve past a
+denial.
+
+Merchant policy gains two thresholds per dimension. One threshold forces a
+choice between blocking legitimate large orders and waving through fraudulent
+ones.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/config/policy.py             |  40 +++++
+ api/policy/engine.py             |  98 +++++++++-
+ api/policy/models.py             | 151 +++++++++++++++-
+ api/policy/rules/action_rules.py | 297 +++++++++++++++++++++++++++++++
+ 4 files changed, 581 insertions(+), 5 deletions(-)
+ create mode 100644 api/policy/rules/action_rules.py
+
+diff --git a/api/config/policy.py b/api/config/policy.py
+index 7144384..1237244 100644
+--- a/api/config/policy.py
++++ b/api/config/policy.py
+@@ -28,6 +28,46 @@ class MerchantPolicy(BaseModel):
+     max_payment_links_per_session_per_hour: int = 3
+     block_on_anomaly_score_gte: float = 0.85
+ 
++    # --- financial action limits (phase 5) ---------------------------------
++    # Every limit here is a *hard* number rather than a percentage of
++    # something, because a limit expressed relative to a value an attacker can
++    # inflate is not a limit. Two thresholds per dimension, deliberately:
++    # one that escalates to a human, one that refuses outright. A single
++    # threshold forces a choice between blocking legitimate large orders and
++    # waving through fraudulent ones.
++
++    #: Refuse any single payment above this. ₹5,00,000.
++    max_payment_paise: int = 50_000_000
++    #: Above this a payment needs a human. ₹1,00,000.
++    escalate_payment_above_paise: int = 10_000_000
++    #: Refuse any single refund above this. ₹5,00,000.
++    max_refund_paise: int = 50_000_000
++    #: Above this a refund needs a human. ₹25,000. Lower than the payment
++    #: threshold on purpose: money leaving is harder to claw back than money
++    #: arriving, so it earns scrutiny sooner.
++    escalate_refund_above_paise: int = 2_500_000
++    #: Refuse a payout above this. ₹10,00,000.
++    max_payout_paise: int = 100_000_000
++    #: Refuse campaign spend above this. ₹2,00,000.
++    max_campaign_spend_paise: int = 20_000_000
++    #: Total money this merchant may move in a day, all kinds. ₹20,00,000.
++    daily_total_cap_paise: int = 200_000_000
++    #: Actions of one kind per hour before escalating, and before refusing.
++    escalate_actions_per_hour_above: int = 20
++    max_actions_per_hour: int = 60
++    #: A refund is only eligible within this many days of capture.
++    refund_window_days: int = 180
++    #: Approvals needed when risk comes back high. Two is a quorum: it takes
++    #: two compromised accounts rather than one to move flagged money.
++    quorum_approvals: int = 2
++    #: A pending authorization dies after this long. Short, because a stale
++    #: approval is an approval granted against facts that no longer hold.
++    authorization_ttl_seconds: int = 900
++    #: Countries a buyer may transact from. Empty means "no restriction".
++    allowed_countries: list[str] = Field(default_factory=lambda: ["IN"])
++    #: Countries refused outright regardless of the allow list.
++    blocked_countries: list[str] = Field(default_factory=list)
++
+ 
+ @lru_cache
+ def load_merchant_policy(merchant_id: str = "merchant_keen") -> MerchantPolicy:
+diff --git a/api/policy/engine.py b/api/policy/engine.py
+index 502ae31..9da54a5 100644
+--- a/api/policy/engine.py
++++ b/api/policy/engine.py
+@@ -1,12 +1,37 @@
+-"""PolicyEngine — synchronous guardrail evaluation (no LLM)."""
++"""PolicyEngine - synchronous guardrail evaluation (no LLM).
++
++Two entry points, one engine.
++
++``evaluate`` judges a negotiated offer: discounts, margin, inventory. It is the
++Phase 2 surface and is unchanged.
++
++``evaluate_action`` judges a financial action - a payment, refund, payout or
++campaign spend - and answers allow, escalate or deny. It is the first of the
++three Phase 5 gates, and everything that moves money passes through it before
++risk scoring and authorization.
++
++Both are deterministic and free of I/O beyond loading the merchant's policy. No
++language model is consulted on either path. A model in the approve path would
++mean the answer to "may this money move?" could differ between two identical
++requests, which is not a property a payment system may have.
++"""
+ 
+ from __future__ import annotations
+ 
+ from uuid import uuid4
+ 
+-from config.policy import load_merchant_policy
++from config.policy import MerchantPolicy, load_merchant_policy
+ from policy.anomaly import anomaly_score, detect_injection
+-from policy.models import GuardrailDecision, ProposedOffer, RuleResult
++from policy.models import (
++    ActionRuleResult,
++    FinancialAction,
++    GuardrailDecision,
++    PolicyDecision,
++    PolicyOutcome,
++    ProposedOffer,
++    RuleResult,
++)
++from policy.rules.action_rules import ACTION_RULES
+ from policy.rules.evaluators import (
+     rule_currency,
+     rule_inventory_bounds,
+@@ -106,3 +131,70 @@ class PolicyEngine:
+         if any(r.action == "REJECT" for r in results):
+             return "REJECTED"
+         return "APPROVED"
++
++    # --- financial actions (phase 5) ---------------------------------------
++
++    def evaluate_action(
++        self,
++        action: FinancialAction,
++        *,
++        policy: MerchantPolicy | None = None,
++    ) -> PolicyDecision:
++        """Judge one attempt to move money.
++
++        Runs every rule - not just up to the first failure. Short-circuiting
++        would be faster and would produce a decision record that names one
++        reason when there were four, which turns "fix the problem" into four
++        round trips. Cost is a handful of comparisons; the rules touch nothing.
++
++        Aggregation is deny beats escalate beats allow, unconditionally. A
++        human may approve past an *escalation*; nobody may approve past a
++        *denial*, which is the difference between the two outcomes. Aggregating
++        the other way - letting an allow anywhere soften a deny - is how a
++        gate ends up with a bypass built into its own arithmetic.
++
++        ``policy`` is injectable so tests and per-merchant overrides do not
++        have to reach through a module-level cache.
++        """
++        policy = policy or load_merchant_policy(action.merchant_id)
++
++        results: list[ActionRuleResult] = [rule(action, policy) for rule in ACTION_RULES]
++        outcome = self._aggregate_action(results)
++        reasons = [r.message for r in results if not r.passed and r.message]
++
++        return PolicyDecision(
++            decision_id=str(uuid4()),
++            outcome=outcome,
++            action_kind=action.kind,
++            amount_paise=action.amount_paise,
++            action_fingerprint=action.fingerprint(),
++            reasons=reasons,
++            rule_results=results,
++            policy_version=policy.policy_version,
++            metadata={
++                "merchant_id": action.merchant_id,
++                "actor_role": action.actor_role,
++                "subject_id": action.subject_id,
++                "rules_evaluated": len(results),
++            },
++        )
++
++    @staticmethod
++    def _aggregate_action(results: list[ActionRuleResult]) -> PolicyOutcome:
++        """Fail closed, and in a fixed order.
++
++        Written as two explicit passes rather than a max() over an ordered
++        enum. The ordering of an enum is an implementation detail that a later
++        edit can reorder without anyone noticing; this cannot be reordered by
++        accident.
++        """
++        if any(r.outcome is PolicyOutcome.DENY for r in results):
++            return PolicyOutcome.DENY
++        if any(r.outcome is PolicyOutcome.ESCALATE for r in results):
++            return PolicyOutcome.ESCALATE
++        return PolicyOutcome.ALLOW
++
++
++#: Shared instance. The engine holds no mutable state - every call reads its
++#: policy and returns a new decision - so one instance is safe across requests.
++policy_engine = PolicyEngine()
+diff --git a/api/policy/models.py b/api/policy/models.py
+index 74e044f..ac6bac2 100644
+--- a/api/policy/models.py
++++ b/api/policy/models.py
+@@ -1,10 +1,21 @@
+-"""Policy evaluation models."""
++"""Policy evaluation models.
++
++Two families live here. The offer models (``ProposedOffer``, ``RuleResult``,
++``GuardrailDecision``) judge a negotiated cart. The action models
++(``FinancialAction``, ``PolicyDecision``) judge an attempt to move money.
++
++They are kept apart rather than merged into one general "thing being checked",
++because the questions differ: an offer is asked "is this price legitimate?",
++an action is asked "may this money move, and who has to say so?".
++"""
+ 
+ from __future__ import annotations
+ 
++from enum import Enum
++from hashlib import sha256
+ from typing import Any, Literal
+ 
+-from pydantic import BaseModel, Field
++from pydantic import BaseModel, ConfigDict, Field, StrictInt
+ 
+ 
+ class LineItem(BaseModel):
+@@ -45,3 +56,139 @@ class GuardrailDecision(BaseModel):
+     rule_results: list[RuleResult] = Field(default_factory=list)
+     policy_version: str
+     metadata: dict[str, Any] = Field(default_factory=dict)
++
++
++# --- financial actions ------------------------------------------------------
++# Phase 5. The models above describe a *negotiated offer*; the ones below
++# describe any *financial action* - a payment, a refund, a payout, a campaign
++# spend. They are separate on purpose: an offer is a proposal about a cart, an
++# action is an attempt to move money, and the rules that guard them differ.
++
++
++class ActionKind(str, Enum):
++    """What kind of money movement is being attempted.
++
++    A closed set, not a free string. A typo in an action kind must be a
++    validation failure, not an action that silently matches no rule and is
++    therefore allowed - the classic way a deny-list lets something through.
++    """
++
++    PAYMENT = "payment"
++    REFUND = "refund"
++    PAYOUT = "payout"
++    CAMPAIGN_SPEND = "campaign_spend"
++
++
++class FinancialAction(BaseModel):
++    """One attempt to move money, described completely enough to judge it.
++
++    Everything the rules need is a field here. Nothing is read from a clock, a
++    database or a global inside rule evaluation, which is what makes a decision
++    reproducible: replay the same action and you get the same verdict, forever.
++    That property is worth more than the convenience of looking things up
++    mid-rule, because it is what lets an auditor re-run a disputed decision.
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    kind: ActionKind
++    merchant_id: str = Field(min_length=1)
++    #: Integer paise. StrictInt so a JSON float is refused rather than
++    #: truncated into a different amount.
++    amount_paise: StrictInt = Field(ge=0)
++    currency: Literal["INR"] = "INR"
++    #: What the money is about: an order id, a payout id, a campaign id. Part
++    #: of the authorization fingerprint, so an approval for one subject cannot
++    #: be spent on another.
++    subject_id: str = Field(min_length=1)
++    #: Who is asking. Never taken from a request body - the routers fill this
++    #: from the verified token.
++    actor_id: str = Field(min_length=1)
++    actor_role: str = Field(min_length=1)
++
++    # --- context the rules score against, all caller-supplied and explicit ---
++    #: Money already moved by this merchant today, in paise.
++    today_total_paise: StrictInt = Field(default=0, ge=0)
++    #: Actions of this kind in the trailing hour.
++    actions_last_hour: StrictInt = Field(default=0, ge=0)
++    #: For refunds: what was actually captured, and what has already gone back.
++    captured_paise: StrictInt = Field(default=0, ge=0)
++    already_refunded_paise: StrictInt = Field(default=0, ge=0)
++    #: Risk context.
++    buyer_age_days: StrictInt = Field(default=365, ge=0)
++    buyer_prior_orders: StrictInt = Field(default=10, ge=0)
++    buyer_country: str = "IN"
++    ip_country: str = "IN"
++    metadata: dict[str, Any] = Field(default_factory=dict)
++
++    def fingerprint(self) -> str:
++        """A stable hash of the parts an approval is granted *for*.
++
++        Only the identifying and financial fields go in. Context like velocity
++        counters deliberately does not: those change between requesting an
++        authorization and spending it, and an approval that expired because a
++        counter ticked would be useless. What must not change is *what* is
++        being paid, *how much*, and *to what*.
++        """
++        canonical = "|".join(
++            [
++                self.kind.value,
++                self.merchant_id,
++                str(self.amount_paise),
++                self.currency,
++                self.subject_id,
++            ]
++        )
++        return sha256(canonical.encode("utf-8")).hexdigest()
++
++
++class PolicyOutcome(str, Enum):
++    """Deny beats escalate beats allow. Always aggregated in that order."""
++
++    ALLOW = "allow"
++    ESCALATE = "escalate"
++    DENY = "deny"
++
++
++class ActionRuleResult(BaseModel):
++    """One rule's verdict, kept even when it passed.
++
++    A decision that recorded only its failures cannot answer "was the daily cap
++    checked at all?" six months later during a dispute. Every rule reports.
++    """
++
++    rule_id: str
++    outcome: PolicyOutcome = PolicyOutcome.ALLOW
++    message: str = ""
++    details: dict[str, Any] = Field(default_factory=dict)
++
++    @property
++    def passed(self) -> bool:
++        return self.outcome is PolicyOutcome.ALLOW
++
++
++class PolicyDecision(BaseModel):
++    """The verdict on one financial action.
++
++    Stored verbatim on the authorization record. It is the evidence that a gate
++    ran, so it has to be self-contained: the rules that fired, the policy
++    version they came from, and the fingerprint of the action they judged.
++    """
++
++    decision_id: str
++    outcome: PolicyOutcome
++    action_kind: ActionKind
++    amount_paise: int
++    action_fingerprint: str
++    reasons: list[str] = Field(default_factory=list)
++    rule_results: list[ActionRuleResult] = Field(default_factory=list)
++    policy_version: str
++    metadata: dict[str, Any] = Field(default_factory=dict)
++
++    @property
++    def allowed(self) -> bool:
++        return self.outcome is PolicyOutcome.ALLOW
++
++    @property
++    def denied(self) -> bool:
++        return self.outcome is PolicyOutcome.DENY
+diff --git a/api/policy/rules/action_rules.py b/api/policy/rules/action_rules.py
+new file mode 100644
+index 0000000..861deae
+--- /dev/null
++++ b/api/policy/rules/action_rules.py
+@@ -0,0 +1,297 @@
++"""Deterministic rules for financial actions.
++
++Every function here is pure: it takes the action and the merchant policy and
++returns a verdict. No clock, no database, no globals. That is not stylistic
++tidiness - it is what makes a decision reproducible. When a merchant disputes a
++refusal eight months later, the only way to answer honestly is to replay the
++exact inputs and get the exact same verdict.
++
++Each rule reports even when it passes. A decision record that listed only the
++failures could not answer "was the daily cap checked?", and "we have no
++evidence it ran" is indistinguishable from "it did not run".
++
++Rules never mutate the action. A rule that quietly clamped an amount would
++produce a decision approving a number the caller never asked for, and the
++caller would go on to charge its own, larger figure.
++"""
++
++from __future__ import annotations
++
++from config.policy import MerchantPolicy
++from policy.models import ActionKind, ActionRuleResult, FinancialAction, PolicyOutcome
++
++#: Which roles may even attempt each kind of money movement.
++#:
++#: An allow-list, not a deny-list. An unknown role matches nothing and is
++#: refused; with a deny-list, a role added later would be permitted everything
++#: until someone remembered to forbid it.
++ACTOR_MATRIX: dict[ActionKind, frozenset[str]] = {
++    ActionKind.PAYMENT: frozenset({"shopper", "service", "manager", "admin"}),
++    ActionKind.REFUND: frozenset({"service", "manager", "admin"}),
++    # Payouts move money out to a bank account. Admin only.
++    ActionKind.PAYOUT: frozenset({"admin"}),
++    ActionKind.CAMPAIGN_SPEND: frozenset({"manager", "admin"}),
++}
++
++#: Hard ceiling per kind, read off the policy.
++_CEILING_FIELD: dict[ActionKind, str] = {
++    ActionKind.PAYMENT: "max_payment_paise",
++    ActionKind.REFUND: "max_refund_paise",
++    ActionKind.PAYOUT: "max_payout_paise",
++    ActionKind.CAMPAIGN_SPEND: "max_campaign_spend_paise",
++}
++
++#: Escalation threshold per kind. A kind absent from this map never escalates
++#: on amount alone - it is governed by its ceiling and by risk.
++_ESCALATE_FIELD: dict[ActionKind, str] = {
++    ActionKind.PAYMENT: "escalate_payment_above_paise",
++    ActionKind.REFUND: "escalate_refund_above_paise",
++}
++
++
++def _allow(rule_id: str, message: str = "", **details) -> ActionRuleResult:
++    return ActionRuleResult(
++        rule_id=rule_id, outcome=PolicyOutcome.ALLOW, message=message, details=details
++    )
++
++
++def _deny(rule_id: str, message: str, **details) -> ActionRuleResult:
++    return ActionRuleResult(
++        rule_id=rule_id, outcome=PolicyOutcome.DENY, message=message, details=details
++    )
++
++
++def _escalate(rule_id: str, message: str, **details) -> ActionRuleResult:
++    return ActionRuleResult(
++        rule_id=rule_id, outcome=PolicyOutcome.ESCALATE, message=message, details=details
++    )
++
++
++# --- rules ------------------------------------------------------------------
++
++
++def rule_currency(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """One currency per merchant, checked rather than assumed.
++
++    The type system already restricts this to INR today. The rule stays because
++    the day a second currency is added, an unchecked mixed-currency comparison
++    of ``amount_paise`` against a rupee limit is a silent factor-of-a-hundred
++    error, and this is where that gets caught.
++    """
++    if action.currency != policy.currency:
++        return _deny(
++            "ACTION_CURRENCY",
++            f"{action.currency} is not accepted by this merchant",
++            expected=policy.currency,
++            got=action.currency,
++        )
++    return _allow("ACTION_CURRENCY")
++
++
++def rule_amount_positive(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """A money movement of zero is not a money movement.
++
++    Refusing it is not pedantry: a zero-amount action that reaches an
++    authorization record produces an approval whose fingerprint covers no
++    money, which is exactly the shape an attacker wants when hunting for an
++    approval to reuse.
++    """
++    if action.amount_paise <= 0:
++        return _deny(
++            "ACTION_AMOUNT_POSITIVE",
++            "amount must be greater than zero",
++            amount_paise=action.amount_paise,
++        )
++    return _allow("ACTION_AMOUNT_POSITIVE")
++
++
++def rule_amount_ceiling(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Refuse anything above the hard cap for this kind.
++
++    Deny, never escalate. A ceiling that a human could approve past is a
++    suggestion, and the point of the ceiling is that no single approval - or
++    single compromised approver - can move an unbounded amount.
++    """
++    field = _CEILING_FIELD.get(action.kind)
++    if field is None:  # pragma: no cover - ActionKind is closed and fully mapped
++        return _deny("ACTION_AMOUNT_CEILING", f"no ceiling configured for {action.kind.value}")
++
++    ceiling = getattr(policy, field)
++    if action.amount_paise > ceiling:
++        return _deny(
++            "ACTION_AMOUNT_CEILING",
++            f"{action.kind.value} of {action.amount_paise} paise exceeds the "
++            f"ceiling of {ceiling} paise",
++            amount_paise=action.amount_paise,
++            ceiling_paise=ceiling,
++        )
++    return _allow("ACTION_AMOUNT_CEILING", ceiling_paise=ceiling)
++
++
++def rule_amount_escalation(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Send large-but-legal amounts to a human instead of refusing them."""
++    field = _ESCALATE_FIELD.get(action.kind)
++    if field is None:
++        return _allow("ACTION_AMOUNT_ESCALATION", "kind has no amount escalation threshold")
++
++    threshold = getattr(policy, field)
++    if action.amount_paise > threshold:
++        return _escalate(
++            "ACTION_AMOUNT_ESCALATION",
++            f"{action.kind.value} of {action.amount_paise} paise is above the "
++            f"review threshold of {threshold} paise",
++            amount_paise=action.amount_paise,
++            threshold_paise=threshold,
++        )
++    return _allow("ACTION_AMOUNT_ESCALATION", threshold_paise=threshold)
++
++
++def rule_daily_cap(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Cap what one merchant can move in a day, cumulatively.
++
++    Checked against the total *including* this action. Checking the running
++    total alone would let the cap be exceeded by exactly the size of the last
++    action - and the last action is the one an attacker chooses.
++    """
++    projected = action.today_total_paise + action.amount_paise
++    if projected > policy.daily_total_cap_paise:
++        return _deny(
++            "ACTION_DAILY_CAP",
++            f"this action would bring today's total to {projected} paise, over "
++            f"the daily cap of {policy.daily_total_cap_paise} paise",
++            today_total_paise=action.today_total_paise,
++            projected_paise=projected,
++            cap_paise=policy.daily_total_cap_paise,
++        )
++    return _allow("ACTION_DAILY_CAP", projected_paise=projected)
++
++
++def rule_velocity(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Rate-limit money movement, with review before refusal.
++
++    Two thresholds. A burst of activity is usually a sale, occasionally a
++    compromised key; escalating first lets the legitimate case through with a
++    human's blessing instead of failing an honest merchant's busiest hour.
++    """
++    count = action.actions_last_hour
++    if count >= policy.max_actions_per_hour:
++        return _deny(
++            "ACTION_VELOCITY",
++            f"{count} {action.kind.value} actions in the last hour exceeds the "
++            f"limit of {policy.max_actions_per_hour}",
++            actions_last_hour=count,
++            limit=policy.max_actions_per_hour,
++        )
++    if count >= policy.escalate_actions_per_hour_above:
++        return _escalate(
++            "ACTION_VELOCITY",
++            f"{count} {action.kind.value} actions in the last hour is above the "
++            f"review threshold of {policy.escalate_actions_per_hour_above}",
++            actions_last_hour=count,
++            threshold=policy.escalate_actions_per_hour_above,
++        )
++    return _allow("ACTION_VELOCITY", actions_last_hour=count)
++
++
++def rule_actor_permitted(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Only certain roles may attempt certain kinds of movement.
++
++    This duplicates the permission check the router already made, on purpose.
++    The router guards one entry point; this guards the decision itself, so a
++    background job or a future internal caller that never passes through a
++    router is judged by the same rule.
++    """
++    allowed = ACTOR_MATRIX.get(action.kind, frozenset())
++    if action.actor_role not in allowed:
++        return _deny(
++            "ACTION_ACTOR_PERMITTED",
++            f"role '{action.actor_role}' may not initiate a {action.kind.value}",
++            role=action.actor_role,
++            allowed=sorted(allowed),
++        )
++    return _allow("ACTION_ACTOR_PERMITTED", role=action.actor_role)
++
++
++def rule_refund_within_capture(
++    action: FinancialAction, policy: MerchantPolicy
++) -> ActionRuleResult:
++    """A refund may not exceed what is left of what was captured.
++
++    The subtraction is the whole rule: refunding against the *captured* amount
++    without deducting earlier refunds is how the same money leaves twice.
++    """
++    if action.kind is not ActionKind.REFUND:
++        return _allow("ACTION_REFUND_WITHIN_CAPTURE", "not a refund")
++
++    refundable = action.captured_paise - action.already_refunded_paise
++    if refundable <= 0:
++        return _deny(
++            "ACTION_REFUND_WITHIN_CAPTURE",
++            "nothing left to refund on this payment",
++            captured_paise=action.captured_paise,
++            already_refunded_paise=action.already_refunded_paise,
++        )
++    if action.amount_paise > refundable:
++        return _deny(
++            "ACTION_REFUND_WITHIN_CAPTURE",
++            f"refund of {action.amount_paise} paise exceeds the {refundable} "
++            "paise still refundable",
++            amount_paise=action.amount_paise,
++            refundable_paise=refundable,
++        )
++    return _allow("ACTION_REFUND_WITHIN_CAPTURE", refundable_paise=refundable)
++
++
++def rule_geography(action: FinancialAction, policy: MerchantPolicy) -> ActionRuleResult:
++    """Refuse blocked countries; send unfamiliar ones to review.
++
++    An empty allow list means "no geographic restriction", not "allow nothing".
++    The distinction matters because an unconfigured merchant must be able to
++    trade, and a policy that fails closed on an empty list would silently stop
++    every transaction the first time someone cleared the field.
++    """
++    country = (action.buyer_country or "").upper()
++    blocked = {c.upper() for c in policy.blocked_countries}
++    allowed = {c.upper() for c in policy.allowed_countries}
++
++    if country in blocked:
++        return _deny("ACTION_GEOGRAPHY", f"{country} is a blocked country", country=country)
++    if allowed and country not in allowed:
++        return _escalate(
++            "ACTION_GEOGRAPHY",
++            f"{country} is outside this merchant's usual markets",
++            country=country,
++            allowed=sorted(allowed),
++        )
++    return _allow("ACTION_GEOGRAPHY", country=country)
++
++
++#: Evaluated in this order. Order does not change the verdict - the aggregation
++#: is deny-beats-escalate-beats-allow regardless - but it fixes the order rules
++#: appear in the decision record, which makes two records comparable by eye.
++ACTION_RULES = (
++    rule_currency,
++    rule_amount_positive,
++    rule_actor_permitted,
++    rule_amount_ceiling,
++    rule_amount_escalation,
++    rule_refund_within_capture,
++    rule_daily_cap,
++    rule_velocity,
++    rule_geography,
++)
++
++
++__all__ = [
++    "ACTION_RULES",
++    "ACTOR_MATRIX",
++    "rule_actor_permitted",
++    "rule_amount_ceiling",
++    "rule_amount_escalation",
++    "rule_amount_positive",
++    "rule_currency",
++    "rule_daily_cap",
++    "rule_geography",
++    "rule_refund_within_capture",
++    "rule_velocity",
++]
+-- 
+2.43.0
+
+
+From e6a46dc742cefd1a1f7a5c59e5e5e61a01e3f39c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 2/6] feat(risk): four-signal scoring for financial actions
+
+Scores amount, geography, new-buyer and velocity into a low/medium/high band
+whose only output is how many humans must approve. Risk cannot allow and
+cannot refuse - a scorer that could block by itself is one scoring bug away
+from refusing every transaction in the country.
+
+Aggregation is dominant-signal-plus-corroboration rather than a weighted
+average. An average lets one severe signal be diluted by three quiet ones: a
+maxed-out geography flag averaged with three zeroes scores 0.25 and reads as
+low, which is precisely backwards. The saturating term means extra signals
+always raise the score but can never reach 1.0 alone, so weak evidence cannot
+accumulate into certainty.
+
+Signal thresholds are shared with the policy rules, so risk and policy cannot
+drift into disagreeing about what fast or large means.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/modules/risk/__init__.py |   7 +
+ api/modules/risk/service.py  | 300 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 307 insertions(+)
+ create mode 100644 api/modules/risk/__init__.py
+ create mode 100644 api/modules/risk/service.py
+
+diff --git a/api/modules/risk/__init__.py b/api/modules/risk/__init__.py
+new file mode 100644
+index 0000000..b13eb72
+--- /dev/null
++++ b/api/modules/risk/__init__.py
+@@ -0,0 +1,7 @@
++"""Risk scoring for financial actions.
++
++Deliberately empty. Re-exporting the service here would make
++``modules.risk`` import ``modules.risk.service``, which imports the policy
++models - and the authorization service imports both. Keeping the package
++namespace bare is what stops that from becoming an import cycle.
++"""
+diff --git a/api/modules/risk/service.py b/api/modules/risk/service.py
+new file mode 100644
+index 0000000..914f305
+--- /dev/null
++++ b/api/modules/risk/service.py
+@@ -0,0 +1,300 @@
++"""Risk scoring: how worried should we be about this particular action?
++
++The second Phase 5 gate. Policy has already answered the categorical question -
++*may* this happen at all - and this answers the graded one: how much scrutiny
++does it deserve? The two are separate because they fail differently. A policy
++denial is a rule being broken and no amount of context excuses it; a high risk
++score is a pattern that is usually fine and occasionally fraud, and the right
++response is a human, not a refusal.
++
++Four signals, as narrow and explainable as they can be made:
++
++``amount``      how large this is relative to what this merchant normally moves
++``geography``   where the buyer is, and whether that agrees with where they are
++``new_buyer``   account age and history - fraud arrives with no past
++``velocity``    how much has already happened in the trailing hour
++
++Every signal is a pure function of values passed in. Nothing here reads a
++clock, a database or a request. That is what lets a score be recomputed from a
++stored decision and come out the same, which is the only way to audit one.
++
++The output is advisory to the authorization service, never a gate on its own.
++A score that could block by itself would be a scoring bug away from refusing
++every transaction in the country.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any
++
++from config.policy import MerchantPolicy, load_merchant_policy
++from policy.models import ActionKind, FinancialAction
++
++#: Band edges. Below LOW_MAX is routine, below MEDIUM_MAX wants one pair of
++#: eyes, above it wants a quorum. Named constants rather than literals buried
++#: in a chain of ifs, because these are the numbers a risk team will argue
++#: about and they should be findable.
++LOW_MAX = 0.35
++MEDIUM_MAX = 0.70
++
++#: Equal-weight baseline. A weight above this amplifies its signal, below it
++#: dampens - so the weights read as "relative emphasis", not as fractions that
++#: must be mentally divided by their sum.
++_BASELINE = 0.25
++
++
++class RiskBand(str, Enum):
++    LOW = "low"
++    MEDIUM = "medium"
++    HIGH = "high"
++
++
++@dataclass(frozen=True)
++class RiskAssessment:
++    """What the scorer concluded, and why.
++
++    Frozen: an assessment is evidence about a moment. Code that wanted to
++    "adjust the score a bit" downstream would be quietly rewriting the record
++    an auditor later reads.
++    """
++
++    score: float
++    band: RiskBand
++    signals: list[str] = field(default_factory=list)
++    components: dict[str, float] = field(default_factory=dict)
++    metadata: dict[str, Any] = field(default_factory=dict)
++
++    @property
++    def is_high(self) -> bool:
++        return self.band is RiskBand.HIGH
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "score": round(self.score, 4),
++            "band": self.band.value,
++            "signals": list(self.signals),
++            "components": {k: round(v, 4) for k, v in self.components.items()},
++            "metadata": dict(self.metadata),
++        }
++
++
++class RiskService:
++    """Scores a financial action from four independent signals."""
++
++    def __init__(
++        self,
++        *,
++        amount_weight: float = 0.30,
++        geo_weight: float = 0.25,
++        new_buyer_weight: float = 0.20,
++        velocity_weight: float = 0.25,
++    ) -> None:
++        self.amount_weight = amount_weight
++        self.geo_weight = geo_weight
++        self.new_buyer_weight = new_buyer_weight
++        self.velocity_weight = velocity_weight
++
++    # --- public -------------------------------------------------------------
++
++    def assess(
++        self, action: FinancialAction, *, policy: MerchantPolicy | None = None
++    ) -> RiskAssessment:
++        """Score one action. Same inputs, same score, always."""
++        policy = policy or load_merchant_policy(action.merchant_id)
++
++        raw = {
++            "amount": self._score_amount(action, policy),
++            "geography": self._score_geography(action, policy),
++            "new_buyer": self._score_new_buyer(action),
++            "velocity": self._score_velocity(action, policy),
++        }
++        weights = {
++            "amount": self.amount_weight,
++            "geography": self.geo_weight,
++            "new_buyer": self.new_buyer_weight,
++            "velocity": self.velocity_weight,
++        }
++        adjusted = {
++            name: min(1.0, value * weights[name] / _BASELINE) for name, value in raw.items()
++        }
++
++        score = self._combine(adjusted)
++        band = self.band_for(score)
++        signals = [self._describe(name, action, raw[name]) for name in raw if raw[name] > 0.0]
++
++        return RiskAssessment(
++            score=score,
++            band=band,
++            signals=signals,
++            components=raw,
++            metadata={
++                "adjusted": {k: round(v, 4) for k, v in adjusted.items()},
++                "weights": weights,
++                "action_kind": action.kind.value,
++                "policy_version": policy.policy_version,
++            },
++        )
++
++    @staticmethod
++    def band_for(score: float) -> RiskBand:
++        if score < LOW_MAX:
++            return RiskBand.LOW
++        if score < MEDIUM_MAX:
++            return RiskBand.MEDIUM
++        return RiskBand.HIGH
++
++    # --- aggregation --------------------------------------------------------
++
++    @staticmethod
++    def _combine(adjusted: dict[str, float]) -> float:
++        """The strongest signal sets the floor; the rest escalate from there.
++
++        A plain weighted average is the wrong shape for risk. It lets one
++        severe signal be diluted by three quiet ones: a maxed-out geography
++        flag averaged with three zeroes scores 0.25 and reads as "low", which
++        is precisely backwards - a single unambiguous fraud indicator is not
++        made safe by the transaction being unremarkable in other respects.
++
++        So: take the strongest signal as the base, then climb through the
++        remaining headroom in proportion to how much the others corroborate it.
++        ``corr / (1 + corr)`` saturates, so additional signals always raise the
++        score and can never on their own reach 1.0 - only a maxed-out dominant
++        signal can. Weak evidence accumulating forever into certainty is the
++        failure mode that produces false positives at scale.
++        """
++        if not adjusted:  # pragma: no cover - the signal set is fixed
++            return 0.0
++        base = max(adjusted.values())
++        corroboration = sum(adjusted.values()) - base
++        score = base + (1.0 - base) * (corroboration / (1.0 + corroboration))
++        return min(1.0, max(0.0, score))
++
++    # --- signals ------------------------------------------------------------
++
++    @staticmethod
++    def _reference_amount(action: FinancialAction, policy: MerchantPolicy) -> int:
++        """What counts as "large" for this kind of action.
++
++        The escalation threshold where one exists, the hard ceiling otherwise.
++        Scoring every kind against one global number would make a ₹50,000
++        payout look as ordinary as a ₹50,000 payment, when a payout is the one
++        that empties an account.
++        """
++        thresholds = {
++            ActionKind.PAYMENT: policy.escalate_payment_above_paise,
++            ActionKind.REFUND: policy.escalate_refund_above_paise,
++            ActionKind.PAYOUT: policy.max_payout_paise,
++            ActionKind.CAMPAIGN_SPEND: policy.max_campaign_spend_paise,
++        }
++        return max(1, thresholds.get(action.kind, policy.max_payment_paise))
++
++    def _score_amount(self, action: FinancialAction, policy: MerchantPolicy) -> float:
++        """Ramp with size, relative to what is normal for this action kind.
++
++        Half the reference amount is where interest starts. Below that the
++        signal is zero rather than "a little bit": a scorer that returns a
++        small positive number for every ordinary transaction adds a constant
++        to every score and moves the band edges without anyone deciding to.
++        """
++        reference = self._reference_amount(action, policy)
++        ratio = action.amount_paise / reference
++
++        if ratio <= 0.5:
++            return 0.0
++        if ratio <= 1.0:
++            return 0.2
++        if ratio <= 2.0:
++            # Just over the line. Enough for one pair of eyes, not for a
++            # quorum: a cliff where one rupee more demands a second approver
++            # trains people to split payments to stay under it.
++            return 0.45
++        if ratio <= 4.0:
++            return 0.7
++        return 0.9
++
++    @staticmethod
++    def _score_geography(action: FinancialAction, policy: MerchantPolicy) -> float:
++        """Where they claim to be, and whether the network agrees.
++
++        The mismatch matters more than the country. A buyer in an unusual
++        market is a sale; a buyer whose stated country disagrees with the one
++        their traffic arrives from is either a VPN or someone using a stolen
++        card from somewhere they would rather not name.
++        """
++        buyer = (action.buyer_country or "").upper()
++        ip = (action.ip_country or "").upper()
++        blocked = {c.upper() for c in policy.blocked_countries}
++        allowed = {c.upper() for c in policy.allowed_countries}
++
++        if buyer in blocked or ip in blocked:
++            return 1.0
++        if buyer and ip and buyer != ip:
++            # One pair of eyes on its own. A mismatch is often a traveller or a
++            # VPN, and scoring it high enough to demand a quorum by itself
++            # would put every remote worker's purchase into a manual queue.
++            return 0.6
++        if allowed and buyer and buyer not in allowed:
++            return 0.5
++        return 0.0
++
++    @staticmethod
++    def _score_new_buyer(action: FinancialAction) -> float:
++        """Fraud has no history. Neither does a first-time customer.
++
++        Which is why this signal is scored but never decisive on its own - the
++        two are indistinguishable at this layer, and a system that refused
++        every first purchase would have no second ones. It takes corroboration
++        from another signal to push a new buyer into the high band.
++        """
++        age = action.buyer_age_days
++        orders = action.buyer_prior_orders
++
++        if age == 0 and orders == 0:
++            return 0.8
++        if age < 7 and orders == 0:
++            return 0.5
++        if age < 30 and orders < 2:
++            return 0.3
++        return 0.0
++
++    @staticmethod
++    def _score_velocity(action: FinancialAction, policy: MerchantPolicy) -> float:
++        """How busy the trailing hour has been, against this merchant's limits.
++
++        Scored against the same thresholds the policy rules use, so risk and
++        policy cannot drift into disagreeing about what "fast" means.
++        """
++        count = action.actions_last_hour
++        escalate_at = max(1, policy.escalate_actions_per_hour_above)
++        hard_at = max(escalate_at + 1, policy.max_actions_per_hour)
++
++        if count < escalate_at / 2:
++            return 0.0
++        if count < escalate_at:
++            return 0.3
++        if count < hard_at:
++            return 0.7
++        return 1.0
++
++    # --- explanation --------------------------------------------------------
++
++    @staticmethod
++    def _describe(name: str, action: FinancialAction, value: float) -> str:
++        detail = {
++            "amount": f"amount={action.amount_paise} paise",
++            "geography": f"buyer={action.buyer_country} ip={action.ip_country}",
++            "new_buyer": (
++                f"age_days={action.buyer_age_days} prior_orders={action.buyer_prior_orders}"
++            ),
++            "velocity": f"actions_last_hour={action.actions_last_hour}",
++        }[name]
++        return f"{name} ({detail}, signal={value:.2f})"
++
++
++#: Shared instance. Stateless, so one is enough.
++risk_service = RiskService()
++
++
++__all__ = ["LOW_MAX", "MEDIUM_MAX", "RiskAssessment", "RiskBand", "RiskService", "risk_service"]
+-- 
+2.43.0
+
+
+From 1891167cc6643bf5f2e8bed4cf6bb2f06b1c4be1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 3/6] feat(authorization): the money gate - quorum, single use,
+ scope binding
+
+AuthorizationService runs Policy then Risk then records the verdict. consume()
+is the gate every money path calls, and it refuses unless the record exists in
+this merchant, is approved, is unexpired, is unspent, and the action presented
+now fingerprints identically to the one approved.
+
+The fingerprint is what makes the rest worth having. Without it an attacker
+gets a small refund approved and presents that approval while charging lakhs -
+a signed blank cheque.
+
+Four properties, each with an adversarial test behind it: no self-approval, no
+approver counted twice, single use, scope binding. Enforced in the service
+rather than the router, so background jobs in later phases meet the same bar.
+
+Denials are recorded, not discarded. A refusal that left no trace is invisible
+to whoever investigates why a merchant's payment failed.
+
+RBAC splits request, read and approve into three permissions so separation of
+duties is expressible: support reads everything and approves nothing, and a
+service account may ask but never bless its own request.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/core/rbac.py                      |  25 ++
+ api/modules/authorization/__init__.py |   6 +
+ api/modules/authorization/service.py  | 400 ++++++++++++++++++++++++++
+ api/repositories/authorizations.py    | 178 ++++++++++++
+ 4 files changed, 609 insertions(+)
+ create mode 100644 api/modules/authorization/__init__.py
+ create mode 100644 api/modules/authorization/service.py
+ create mode 100644 api/repositories/authorizations.py
+
+diff --git a/api/core/rbac.py b/api/core/rbac.py
+index b58d915..ef7c192 100644
+--- a/api/core/rbac.py
++++ b/api/core/rbac.py
+@@ -28,6 +28,16 @@ class Permission(str, Enum):
+     API_KEY_MANAGE = "admin:api_keys"
+     WEBHOOK_INTERNAL = "webhook:internal"
+     DEV_SIMULATE = "dev:simulate"
++    # --- phase 5: the money gate ---
++    # Request, read and approve are three permissions rather than one, so that
++    # separation of duties is expressible: the party that asks for money to
++    # move is not the party that blesses it, and an investigator can read every
++    # record without being able to approve any of them.
++    POLICY_EVALUATE = "policy:evaluate"
++    AUTHORIZATION_REQUEST = "authorization:request"
++    AUTHORIZATION_READ = "authorization:read"
++    AUTHORIZATION_APPROVE = "authorization:approve"
++    REFUND_REQUEST = "refund:request"
+ 
+ 
+ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
+@@ -46,6 +56,8 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
+             Permission.ORDER_READ_ANY,
+             Permission.AUDIT_READ,
+             Permission.ESCALATION_READ,
++            # Support can see why money was held, and can approve nothing.
++            Permission.AUTHORIZATION_READ,
+         }
+     ),
+     Role.MANAGER: frozenset(
+@@ -57,6 +69,12 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
+             Permission.ESCALATION_READ,
+             Permission.ESCALATION_RESOLVE,
+             Permission.ADMIN_ESCALATION,
++            Permission.POLICY_EVALUATE,
++            Permission.AUTHORIZATION_REQUEST,
++            Permission.AUTHORIZATION_READ,
++            # Manager is the lowest role that may approve money movement.
++            Permission.AUTHORIZATION_APPROVE,
++            Permission.REFUND_REQUEST,
+         }
+     ),
+     Role.ADMIN: frozenset(Permission),
+@@ -66,6 +84,13 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
+             Permission.SESSION_READ_ANY,
+             Permission.ORDER_READ_ANY,
+             Permission.AUDIT_READ,
++            # A service account may ask for an authorization and read it back.
++            # It may never approve one: an approval is a human act, and a
++            # leaked service key that could approve its own requests would
++            # make the whole gate ceremonial.
++            Permission.POLICY_EVALUATE,
++            Permission.AUTHORIZATION_REQUEST,
++            Permission.AUTHORIZATION_READ,
+         }
+     ),
+ }
+diff --git a/api/modules/authorization/__init__.py b/api/modules/authorization/__init__.py
+new file mode 100644
+index 0000000..95d4f8b
+--- /dev/null
++++ b/api/modules/authorization/__init__.py
+@@ -0,0 +1,6 @@
++"""Authorization: the gate every financial action passes through.
++
++Kept bare for the same reason as ``modules.risk`` - the service imports the
++policy engine and the risk service, and re-exporting it from the package would
++turn that into a cycle the moment anything imports the package for a type.
++"""
+diff --git a/api/modules/authorization/service.py b/api/modules/authorization/service.py
+new file mode 100644
+index 0000000..d90ff10
+--- /dev/null
++++ b/api/modules/authorization/service.py
+@@ -0,0 +1,400 @@
++"""The authorization gate: Policy -> Risk -> Authorization, in that order.
++
++This is the module Phase 5 exists for. Nothing moves money without passing
++through :meth:`AuthorizationService.consume`, and ``consume`` succeeds only for
++a record that policy allowed, risk sized, and - where required - humans
++approved.
++
++The order is not arbitrary:
++
++1. **Policy** answers the categorical question. A denial ends it. Risk is not
++   consulted, because no score excuses a broken rule, and running the scorer
++   anyway would invite someone to later write ``if risk is low: proceed``.
++2. **Risk** sizes the graded question, and its only output is *how many people
++   must say yes*. It cannot allow and it cannot refuse.
++3. **Authorization** records the verdict, collects approvals, and is spent
++   exactly once against exactly one action.
++
++Four properties this module is written to guarantee, each with an adversarial
++test behind it:
++
++``no self-approval``      the requester may never approve their own request
++``no double-counting``    one approver cannot fill a two-person quorum alone
++``single use``            an approval is spent once, then never again
++``scope binding``         an approval is spent only on the action it was for
++
++The last one is the subtle one. Without it, an attacker requests authorization
++for a ₹10 refund, gets it approved, and then presents that authorization while
++charging ₹10,00,000. Binding the approval to a fingerprint of the action's
++identifying and financial fields is what makes the approval mean *this* money
++movement rather than *a* money movement.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime
++from typing import Any
++
++from config.policy import MerchantPolicy, load_merchant_policy
++from core.exceptions import AuthorizationError, ConflictError, NotFoundError
++from core.logging import get_logger
++from core.observability import record_event, span
++from core.rbac import Permission, has_permission
++from modules.risk.service import RiskAssessment, RiskBand, RiskService
++from policy.engine import PolicyEngine
++from policy.models import FinancialAction, PolicyDecision, PolicyOutcome
++from repositories.authorizations import AuthorizationRepository
++
++logger = get_logger(__name__)
++
++#: Statuses from which nothing further can happen.
++_TERMINAL = frozenset({"denied", "consumed", "expired", "revoked"})
++
++
++class AuthorizationService:
++    """Creates, approves and spends authorizations for financial actions."""
++
++    def __init__(
++        self,
++        *,
++        policy_engine: PolicyEngine | None = None,
++        risk: RiskService | None = None,
++        repo: AuthorizationRepository | None = None,
++    ) -> None:
++        self._policy = policy_engine or PolicyEngine()
++        self._risk = risk or RiskService()
++        self._repo = repo or AuthorizationRepository()
++
++    # --- 1. request ---------------------------------------------------------
++
++    async def request(
++        self,
++        action: FinancialAction,
++        *,
++        tenant_id: str | None = None,
++        policy: MerchantPolicy | None = None,
++    ) -> dict[str, Any]:
++        """Run the gates and open an authorization record.
++
++        Always produces a record, including for a denial. A refusal that left
++        no trace would be invisible to anyone investigating why a merchant's
++        payment failed, and the record is the only proof the gate ran at all.
++        A denied record is created already terminal: there is no state it can
++        move to, so no later call can rescue it.
++        """
++        with span("authorization.request", kind=action.kind.value):
++            policy = policy or load_merchant_policy(action.merchant_id)
++
++            decision = self._policy.evaluate_action(action, policy=policy)
++
++            if decision.denied:
++                # Risk is deliberately not scored. A denial is categorical, and
++                # attaching a score to it would invite a future reader to weigh
++                # the two against each other.
++                record = await self._repo.create(
++                    **self._base_fields(action, tenant_id, decision, policy),
++                    risk={},
++                    status="denied",
++                    required_approvals=0,
++                    reasons=decision.reasons,
++                )
++                logger.warning(
++                    "authorization_denied",
++                    authorization_id=record["id"],
++                    merchant_id=action.merchant_id,
++                    kind=action.kind.value,
++                    amount_paise=action.amount_paise,
++                    reasons=decision.reasons,
++                )
++                record_event("authorization_denied")
++                return record
++
++            assessment = self._risk.assess(action, policy=policy)
++            required = self.required_approvals(decision, assessment, policy)
++            status = "approved" if required == 0 else "pending"
++
++            record = await self._repo.create(
++                **self._base_fields(action, tenant_id, decision, policy),
++                risk=assessment.to_dict(),
++                status=status,
++                required_approvals=required,
++                reasons=decision.reasons,
++            )
++            logger.info(
++                "authorization_requested",
++                authorization_id=record["id"],
++                merchant_id=action.merchant_id,
++                kind=action.kind.value,
++                amount_paise=action.amount_paise,
++                outcome=decision.outcome.value,
++                risk_band=assessment.band.value,
++                required_approvals=required,
++                status=status,
++            )
++            record_event("authorization_requested")
++            return record
++
++    @staticmethod
++    def required_approvals(
++        decision: PolicyDecision, risk: RiskAssessment, policy: MerchantPolicy
++    ) -> int:
++        """How many humans must say yes. Deterministic, and total.
++
++        =====================  ===========  ===================================
++        policy outcome         risk band    approvals
++        =====================  ===========  ===================================
++        allow                  low          0 - proceeds unattended
++        allow                  medium       1
++        allow / escalate       high         quorum (2 by default)
++        escalate               low/medium   1
++        =====================  ===========  ===================================
++
++        A denial never reaches this function; it has no approval count because
++        it has no path to approval.
++
++        The quorum for high risk is the one row that matters. One approval
++        means one compromised account is enough to move flagged money; two
++        means an attacker needs two, and the second person is looking at a
++        request the first has already blessed - which is exactly when someone
++        notices it is strange.
++        """
++        if risk.band is RiskBand.HIGH:
++            return max(2, policy.quorum_approvals)
++        if decision.outcome is PolicyOutcome.ESCALATE:
++            return 1
++        if risk.band is RiskBand.MEDIUM:
++            return 1
++        return 0
++
++    # --- 2. read ------------------------------------------------------------
++
++    async def get(self, auth_id: str, *, merchant_id: str) -> dict[str, Any]:
++        """Fetch one record, expiring it lazily if its time has passed.
++
++        Expiry is applied on read rather than by a sweeper. A background job
++        that fell behind would leave records that *look* approved past their
++        deadline, and every caller would have to remember to check the clock
++        themselves. Doing it here means there is no window in which a stale
++        approval reads as live.
++        """
++        record = await self._repo.get(auth_id, merchant_id=merchant_id)
++        if record is None:
++            raise NotFoundError("AUTHORIZATION_NOT_FOUND", f"No authorization {auth_id!r}")
++
++        if self._is_past_expiry(record):
++            expired = await self._repo.mark_expired(auth_id, merchant_id=merchant_id)
++            return expired or record
++        return record
++
++    # --- 3. approve ---------------------------------------------------------
++
++    async def approve(
++        self,
++        auth_id: str,
++        *,
++        merchant_id: str,
++        approver_id: str,
++        approver_role: str,
++    ) -> dict[str, Any]:
++        """Add one approval, and promote to approved once the quorum is met."""
++        with span("authorization.approve", authorization_id=auth_id):
++            record = await self.get(auth_id, merchant_id=merchant_id)
++
++            if not has_permission(approver_role, Permission.AUTHORIZATION_APPROVE):
++                # Checked here as well as at the router. A future internal
++                # caller that never passes through a route must meet the same
++                # bar, and "the router checks it" is not a property this
++                # module can verify.
++                raise AuthorizationError(
++                    "APPROVER_NOT_PERMITTED",
++                    f"role '{approver_role}' may not approve authorizations",
++                )
++
++            if record["status"] == "denied":
++                raise ConflictError(
++                    "AUTHORIZATION_DENIED",
++                    "policy denied this action; it cannot be approved",
++                    {"reasons": record.get("reasons", [])},
++                )
++            if record["status"] == "expired" or self._is_past_expiry(record):
++                raise ConflictError(
++                    "AUTHORIZATION_EXPIRED", "this authorization is no longer valid"
++                )
++            if record["status"] != "pending":
++                raise ConflictError(
++                    "AUTHORIZATION_NOT_PENDING",
++                    f"authorization is {record['status']}, not pending",
++                    {"status": record["status"]},
++                )
++
++            if approver_id == record["requested_by"]:
++                # Four eyes. Without this, a quorum of two is a quorum of one
++                # holding two hats, and every guarantee above it is decoration.
++                raise AuthorizationError(
++                    "SELF_APPROVAL_FORBIDDEN",
++                    "the requester of an authorization may not approve it",
++                )
++
++            if any(a["approver_id"] == approver_id for a in record["approvers"]):
++                raise ConflictError(
++                    "DUPLICATE_APPROVAL",
++                    "this approver has already approved; a quorum needs distinct people",
++                )
++
++            updated = await self._repo.append_approval(
++                auth_id,
++                merchant_id=merchant_id,
++                approver_id=approver_id,
++                approver_role=approver_role,
++            )
++            if updated is None:
++                # Someone transitioned it between the read and the write.
++                raise ConflictError(
++                    "AUTHORIZATION_NOT_PENDING", "authorization changed state concurrently"
++                )
++
++            logger.info(
++                "authorization_approval_added",
++                authorization_id=auth_id,
++                approver_id=approver_id,
++                approvals=len(updated["approvers"]),
++                required=updated["required_approvals"],
++                status=updated["status"],
++            )
++            record_event(
++                "authorization_approved"
++                if updated["status"] == "approved"
++                else "authorization_approval_added"
++            )
++            return updated
++
++    async def revoke(self, auth_id: str, *, merchant_id: str) -> dict[str, Any]:
++        """Withdraw an authorization before it is spent."""
++        record = await self.get(auth_id, merchant_id=merchant_id)
++        revoked = await self._repo.revoke(auth_id, merchant_id=merchant_id)
++        if revoked is None:
++            raise ConflictError(
++                "AUTHORIZATION_NOT_REVOCABLE",
++                f"authorization is {record['status']} and cannot be revoked",
++            )
++        record_event("authorization_revoked")
++        return revoked
++
++    # --- 4. spend -----------------------------------------------------------
++
++    async def consume(
++        self, auth_id: str, *, merchant_id: str, action: FinancialAction
++    ) -> dict[str, Any]:
++        """Spend the authorization on exactly this action.
++
++        **This is the gate.** Every code path that moves money calls it, and it
++        is the only place that can turn an approval into permission to act. It
++        refuses unless all five hold:
++
++        * the record exists inside this merchant,
++        * its status is ``approved`` - not pending, not denied, not revoked,
++        * it has not expired,
++        * it has not already been spent,
++        * the action presented now fingerprints identically to the one that
++          was approved.
++
++        The fingerprint check is what makes the other four worth having. An
++        approval that could be presented against a different amount would be
++        a signed blank cheque.
++        """
++        with span("authorization.consume", authorization_id=auth_id):
++            record = await self.get(auth_id, merchant_id=merchant_id)
++
++            if record["status"] == "consumed":
++                raise ConflictError(
++                    "AUTHORIZATION_ALREADY_CONSUMED",
++                    "this authorization has already been used",
++                    {"consumed_at": str(record.get("consumed_at"))},
++                )
++            if record["status"] == "expired" or self._is_past_expiry(record):
++                raise ConflictError(
++                    "AUTHORIZATION_EXPIRED", "this authorization is no longer valid"
++                )
++            if record["status"] != "approved":
++                raise ConflictError(
++                    "AUTHORIZATION_NOT_APPROVED",
++                    f"authorization is {record['status']}; it has not been approved",
++                    {
++                        "status": record["status"],
++                        "approvals": len(record.get("approvers", [])),
++                        "required_approvals": record.get("required_approvals"),
++                    },
++                )
++
++            if action.fingerprint() != record["action_fingerprint"]:
++                # The amount, subject, kind or currency differs from what was
++                # approved. Refusing is the entire point of binding the scope.
++                logger.warning(
++                    "authorization_scope_mismatch",
++                    authorization_id=auth_id,
++                    merchant_id=merchant_id,
++                    presented_amount_paise=action.amount_paise,
++                    approved_amount_paise=record["amount_paise"],
++                )
++                record_event("authorization_scope_mismatch")
++                raise ConflictError(
++                    "AUTHORIZATION_SCOPE_MISMATCH",
++                    "this authorization was granted for a different action",
++                    {
++                        "approved_amount_paise": record["amount_paise"],
++                        "presented_amount_paise": action.amount_paise,
++                    },
++                )
++
++            consumed = await self._repo.mark_consumed(auth_id, merchant_id=merchant_id)
++            if consumed is None:
++                # Lost the race with a concurrent spend of the same record.
++                raise ConflictError(
++                    "AUTHORIZATION_ALREADY_CONSUMED",
++                    "this authorization was used concurrently",
++                )
++
++            logger.info(
++                "authorization_consumed",
++                authorization_id=auth_id,
++                merchant_id=merchant_id,
++                kind=consumed["action_kind"],
++                amount_paise=consumed["amount_paise"],
++            )
++            record_event("authorization_consumed")
++            return consumed
++
++    # --- helpers ------------------------------------------------------------
++
++    @staticmethod
++    def _is_past_expiry(record: dict[str, Any]) -> bool:
++        expires_at = record.get("expires_at")
++        if expires_at is None:
++            return False
++        if expires_at.tzinfo is None:  # pragma: no cover - stored tz-aware
++            expires_at = expires_at.replace(tzinfo=UTC)
++        return datetime.now(UTC) >= expires_at
++
++    @staticmethod
++    def _base_fields(
++        action: FinancialAction,
++        tenant_id: str | None,
++        decision: PolicyDecision,
++        policy: MerchantPolicy,
++    ) -> dict[str, Any]:
++        return {
++            "merchant_id": action.merchant_id,
++            "tenant_id": tenant_id,
++            "action_kind": action.kind.value,
++            "amount_paise": action.amount_paise,
++            "currency": action.currency,
++            "subject_id": action.subject_id,
++            "action_fingerprint": action.fingerprint(),
++            "requested_by": action.actor_id,
++            "requested_by_role": action.actor_role,
++            "policy_decision": decision.model_dump(mode="json"),
++            "ttl_seconds": policy.authorization_ttl_seconds,
++        }
++
++
++__all__ = ["AuthorizationService"]
+diff --git a/api/repositories/authorizations.py b/api/repositories/authorizations.py
+new file mode 100644
+index 0000000..8455a3e
+--- /dev/null
++++ b/api/repositories/authorizations.py
+@@ -0,0 +1,178 @@
++"""Authorization persistence, scoped to one merchant.
++
++Same storage strategy as the other repositories: an in-memory store for
++development and tests, the ``authorizations`` table behind the same interface
++in deployment (``db/migrations/0003_policy_authorizations.sql``).
++
++Two things this layer is responsible for, and only these two:
++
++**Merchant scoping.** Every read and write takes ``merchant_id`` and filters on
++it. A record belonging to another merchant is reported absent, never forbidden -
++a 403 on a record that exists confirms the id is real to whoever is guessing.
++
++**Atomic state transitions.** ``append_approval`` and ``mark_consumed`` return
++``None`` when the record was not in the state they require. That is what makes
++double-spend detectable rather than merely unlikely: the second concurrent call
++finds nothing to transition instead of transitioning an already-spent record.
++
++Deliberately no business rules here. Whether an approver is allowed to approve,
++whether a quorum is met, whether a fingerprint matches - all of that lives in
++the service. A repository that decided who may approve would be a second place
++to change when the rule changes, and the two would drift.
++"""
++
++from __future__ import annotations
++
++import uuid
++from datetime import UTC, datetime, timedelta
++from typing import Any
++
++_AUTHORIZATIONS: dict[str, dict[str, Any]] = {}
++
++#: Terminal states. A record in one of these never moves again.
++TERMINAL = frozenset({"denied", "consumed", "expired", "revoked"})
++
++
++def _now() -> datetime:
++    return datetime.now(UTC)
++
++
++def reset_authorizations() -> None:
++    """Drop every authorization. For test isolation only."""
++    _AUTHORIZATIONS.clear()
++
++
++class AuthorizationRepository:
++    """Authorization records for one merchant."""
++
++    async def create(
++        self,
++        *,
++        merchant_id: str,
++        tenant_id: str | None,
++        action_kind: str,
++        amount_paise: int,
++        currency: str,
++        subject_id: str,
++        action_fingerprint: str,
++        requested_by: str,
++        requested_by_role: str,
++        status: str,
++        required_approvals: int,
++        policy_decision: dict[str, Any],
++        risk: dict[str, Any],
++        ttl_seconds: int,
++        reasons: list[str] | None = None,
++    ) -> dict[str, Any]:
++        auth_id = f"auth_{uuid.uuid4().hex[:16]}"
++        now = _now()
++        record = {
++            "id": auth_id,
++            "merchant_id": merchant_id,
++            "tenant_id": tenant_id,
++            "action_kind": action_kind,
++            "amount_paise": amount_paise,
++            "currency": currency,
++            "subject_id": subject_id,
++            "action_fingerprint": action_fingerprint,
++            "requested_by": requested_by,
++            "requested_by_role": requested_by_role,
++            "status": status,
++            "required_approvals": required_approvals,
++            "approvers": [],
++            "policy_decision": policy_decision,
++            "risk": risk,
++            "reasons": reasons or [],
++            "created_at": now,
++            # A denied record gets no life of its own: it is already terminal,
++            # and giving it an expiry would imply it could have been used
++            # before then.
++            "expires_at": None if status == "denied" else now + timedelta(seconds=ttl_seconds),
++            "approved_at": now if status == "approved" else None,
++            "consumed_at": None,
++        }
++        _AUTHORIZATIONS[auth_id] = record
++        return dict(record)
++
++    async def get(self, auth_id: str, *, merchant_id: str) -> dict[str, Any] | None:
++        record = _AUTHORIZATIONS.get(auth_id)
++        if record is None or record["merchant_id"] != merchant_id:
++            return None
++        return dict(record)
++
++    async def list_for_merchant(
++        self, *, merchant_id: str, status: str | None = None, limit: int = 50
++    ) -> list[dict[str, Any]]:
++        rows = [
++            dict(r)
++            for r in _AUTHORIZATIONS.values()
++            if r["merchant_id"] == merchant_id and (status is None or r["status"] == status)
++        ]
++        rows.sort(key=lambda r: r["created_at"], reverse=True)
++        return rows[:limit]
++
++    async def append_approval(
++        self,
++        auth_id: str,
++        *,
++        merchant_id: str,
++        approver_id: str,
++        approver_role: str,
++    ) -> dict[str, Any] | None:
++        """Record one approval, promoting to ``approved`` once the quorum is met.
++
++        Returns ``None`` unless the record is currently pending and belongs to
++        this merchant. The caller has already checked those things; checking
++        again here is what closes the window between the check and the write.
++        """
++        record = _AUTHORIZATIONS.get(auth_id)
++        if record is None or record["merchant_id"] != merchant_id:
++            return None
++        if record["status"] != "pending":
++            return None
++
++        record["approvers"].append(
++            {"approver_id": approver_id, "role": approver_role, "at": _now()}
++        )
++        if len(record["approvers"]) >= record["required_approvals"]:
++            record["status"] = "approved"
++            record["approved_at"] = _now()
++        return dict(record)
++
++    async def mark_consumed(self, auth_id: str, *, merchant_id: str) -> dict[str, Any] | None:
++        """Spend the authorization, once.
++
++        ``None`` on the second call is the single-use guarantee. Reading the
++        status, deciding, and then writing would leave a gap two concurrent
++        payments could both pass through; the read and the write happen here,
++        together, with no await between them.
++        """
++        record = _AUTHORIZATIONS.get(auth_id)
++        if record is None or record["merchant_id"] != merchant_id:
++            return None
++        if record["status"] != "approved":
++            return None
++        record["status"] = "consumed"
++        record["consumed_at"] = _now()
++        return dict(record)
++
++    async def mark_expired(self, auth_id: str, *, merchant_id: str) -> dict[str, Any] | None:
++        record = _AUTHORIZATIONS.get(auth_id)
++        if record is None or record["merchant_id"] != merchant_id:
++            return None
++        if record["status"] in TERMINAL:
++            return dict(record)
++        record["status"] = "expired"
++        return dict(record)
++
++    async def revoke(self, auth_id: str, *, merchant_id: str) -> dict[str, Any] | None:
++        record = _AUTHORIZATIONS.get(auth_id)
++        if record is None or record["merchant_id"] != merchant_id:
++            return None
++        if record["status"] in TERMINAL:
++            return None
++        record["status"] = "revoked"
++        return dict(record)
++
++
++__all__ = ["TERMINAL", "AuthorizationRepository", "reset_authorizations"]
+-- 
+2.43.0
+
+
+From 0cba11ef460e57db5fd2bc15f724711a6d8d3f8d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 4/6] feat(refunds): eligibility guard for money going back out
+
+Checks the arithmetic a refund gets wrong quietly: refunding more than was
+captured, forgetting to deduct earlier refunds, refunding an order that was
+never paid, refunding in floats, refunding after the acquirer's window closed.
+A declined card is loud; an over-refund succeeds and surfaces a month later
+during reconciliation.
+
+Decides eligibility and the ceiling, never permission - it hands the
+authorization gate an action to judge rather than judging it, so a
+'small refunds are fine' shortcut cannot grow into a second, weaker gate.
+
+An order with no capture timestamp fails closed: one that cannot be aged
+cannot be shown to be inside the window.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/modules/refunds/__init__.py |   5 +
+ api/modules/refunds/guard.py    | 238 ++++++++++++++++++++++++++++++++
+ 2 files changed, 243 insertions(+)
+ create mode 100644 api/modules/refunds/__init__.py
+ create mode 100644 api/modules/refunds/guard.py
+
+diff --git a/api/modules/refunds/__init__.py b/api/modules/refunds/__init__.py
+new file mode 100644
+index 0000000..57b76aa
+--- /dev/null
++++ b/api/modules/refunds/__init__.py
+@@ -0,0 +1,5 @@
++"""Refund eligibility.
++
++Bare namespace, like the other Phase 5 packages, so importing the package
++cannot drag in the policy engine and the authorization service behind it.
++"""
+diff --git a/api/modules/refunds/guard.py b/api/modules/refunds/guard.py
+new file mode 100644
+index 0000000..562687c
+--- /dev/null
++++ b/api/modules/refunds/guard.py
+@@ -0,0 +1,238 @@
++"""Refund eligibility: may this money go back, and how much of it?
++
++A refund is the money path with the least natural friction and the most ways to
++go wrong. A payment fails loudly when a card declines; a refund succeeds
++quietly, and the mistake is discovered when the books are reconciled a month
++later. So the checks here are arithmetic rather than judgement, and every one
++of them is a subtraction someone has got wrong in production somewhere:
++
++* refunding more than was captured,
++* refunding the full amount twice because earlier refunds were not deducted,
++* refunding an order that was never paid,
++* refunding in floats and losing a paisa per transaction,
++* refunding years later, after the acquirer's window has closed and the money
++  leaves the merchant without ever reaching the cardholder.
++
++The guard decides *eligibility* and *how much*. It does not decide whether the
++refund is allowed to happen - that is the authorization gate's answer, and this
++module hands it the action to judge rather than judging it here. Keeping those
++apart is what stops a "small refunds are fine" shortcut from growing into a
++second, weaker gate beside the real one.
++
++Everything is a pure function of its arguments, ``now`` included. A refund
++verdict has to be reproducible: "was this eligible at the time?" is a question
++that gets asked during chargeback disputes, long after the clock has moved on.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import UTC, datetime, timedelta
++from typing import Any
++
++from config.policy import MerchantPolicy, load_merchant_policy
++from core.exceptions import ValidationError
++from policy.models import ActionKind, FinancialAction
++
++#: Order statuses money can come back from. An allow-list: a status nobody
++#: anticipated must not be refundable by default.
++REFUNDABLE_STATUSES = frozenset({"paid", "captured", "partially_refunded"})
++
++
++@dataclass(frozen=True)
++class RefundVerdict:
++    """Whether a refund may proceed, and the ceiling on it."""
++
++    eligible: bool
++    max_refundable_paise: int
++    reasons: list[str] = field(default_factory=list)
++    #: True when the amount is large enough that the authorization gate will
++    #: certainly demand a human. Advisory - the gate decides for itself.
++    requires_authorization: bool = False
++    details: dict[str, Any] = field(default_factory=dict)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "eligible": self.eligible,
++            "max_refundable_paise": self.max_refundable_paise,
++            "reasons": list(self.reasons),
++            "requires_authorization": self.requires_authorization,
++            "details": dict(self.details),
++        }
++
++
++def _paid_at(order: dict[str, Any]) -> datetime | None:
++    value = order.get("paid_at")
++    if value is None:
++        return None
++    if isinstance(value, str):  # pragma: no cover - Postgres returns datetimes
++        try:
++            value = datetime.fromisoformat(value)
++        except ValueError:
++            return None
++    if value.tzinfo is None:
++        value = value.replace(tzinfo=UTC)
++    return value
++
++
++def refundable_paise(order: dict[str, Any]) -> int:
++    """What is left to give back.
++
++    Captured minus already refunded, floored at zero. The floor matters: a
++    negative "refundable" would compare as less than any requested amount and
++    read as a failure for the wrong reason, hiding the real problem, which is
++    that the books already do not balance.
++    """
++    captured = int(order.get("final_amount_paise") or 0)
++    already = int(order.get("refunded_paise") or 0)
++    return max(0, captured - already)
++
++
++class RefundGuard:
++    """Eligibility rules for refunds."""
++
++    def __init__(self, *, policy: MerchantPolicy | None = None) -> None:
++        self._policy = policy
++
++    def _resolve_policy(self, merchant_id: str) -> MerchantPolicy:
++        return self._policy or load_merchant_policy(merchant_id)
++
++    def evaluate(
++        self,
++        *,
++        order: dict[str, Any] | None,
++        merchant_id: str,
++        amount_paise: Any,
++        now: datetime | None = None,
++    ) -> RefundVerdict:
++        """Judge one proposed refund.
++
++        Collects every reason rather than stopping at the first. A refund
++        refused for four reasons that reports one sends an operator round the
++        loop four times.
++        """
++        now = now or datetime.now(UTC)
++        policy = self._resolve_policy(merchant_id)
++        reasons: list[str] = []
++
++        if order is None:
++            # No order means nothing to reason about - the remaining rules
++            # would all be arithmetic on zeroes and would report misleading
++            # secondary failures.
++            return RefundVerdict(
++                eligible=False,
++                max_refundable_paise=0,
++                reasons=["order not found"],
++                details={"merchant_id": merchant_id},
++            )
++
++        if order.get("merchant_id") != merchant_id:
++            # Same answer as a missing order, and deliberately no detail about
++            # the real owner: confirming that an id belongs to *someone* is
++            # how an attacker maps another merchant's order numbers.
++            return RefundVerdict(
++                eligible=False,
++                max_refundable_paise=0,
++                reasons=["order not found"],
++                details={"merchant_id": merchant_id},
++            )
++
++        # Amount first, and strictly. A float here is the bug that silently
++        # refunds 249 paise instead of 249.9 - and unlike a price, nobody
++        # notices, because the customer got money back.
++        if isinstance(amount_paise, bool) or not isinstance(amount_paise, int):
++            raise ValidationError(
++                "INVALID_AMOUNT",
++                "refund amount must be an integer number of paise, "
++                f"got {type(amount_paise).__name__}",
++                {"field": "amount_paise", "value": repr(amount_paise)},
++            )
++        if amount_paise <= 0:
++            reasons.append("refund amount must be greater than zero")
++
++        status = str(order.get("status") or "")
++        if status not in REFUNDABLE_STATUSES:
++            reasons.append(f"order status {status!r} is not refundable")
++
++        remaining = refundable_paise(order)
++        if remaining <= 0:
++            reasons.append("this order has already been fully refunded")
++        elif amount_paise > remaining:
++            reasons.append(
++                f"refund of {amount_paise} paise exceeds the {remaining} paise "
++                "still refundable on this order"
++            )
++
++        paid_at = _paid_at(order)
++        window = timedelta(days=policy.refund_window_days)
++        if paid_at is None:
++            if status in REFUNDABLE_STATUSES:
++                # A paid order with no capture timestamp cannot be aged, and
++                # an unageable order cannot be shown to be inside the window.
++                # Failing closed is the only safe reading.
++                reasons.append("order has no capture timestamp; refund window cannot be checked")
++        elif now - paid_at > window:
++            reasons.append(
++                f"the {policy.refund_window_days}-day refund window closed on "
++                f"{(paid_at + window).date().isoformat()}"
++            )
++
++        eligible = not reasons
++        return RefundVerdict(
++            eligible=eligible,
++            max_refundable_paise=remaining,
++            reasons=reasons,
++            requires_authorization=(
++                eligible and amount_paise > policy.escalate_refund_above_paise
++            ),
++            details={
++                "order_id": order.get("id"),
++                "status": status,
++                "captured_paise": int(order.get("final_amount_paise") or 0),
++                "already_refunded_paise": int(order.get("refunded_paise") or 0),
++                "refund_window_days": policy.refund_window_days,
++            },
++        )
++
++    @staticmethod
++    def to_action(
++        *,
++        order: dict[str, Any],
++        merchant_id: str,
++        amount_paise: int,
++        actor_id: str,
++        actor_role: str,
++        actions_last_hour: int = 0,
++        today_total_paise: int = 0,
++    ) -> FinancialAction:
++        """Build the action the authorization gate will judge.
++
++        The captured and already-refunded figures are read from the order here
++        rather than accepted from the caller. A caller that could name what was
++        captured could name a larger number and refund against it.
++        """
++        return FinancialAction(
++            kind=ActionKind.REFUND,
++            merchant_id=merchant_id,
++            amount_paise=amount_paise,
++            subject_id=str(order.get("id") or ""),
++            actor_id=actor_id,
++            actor_role=actor_role,
++            captured_paise=int(order.get("final_amount_paise") or 0),
++            already_refunded_paise=int(order.get("refunded_paise") or 0),
++            actions_last_hour=actions_last_hour,
++            today_total_paise=today_total_paise,
++        )
++
++
++#: Shared instance. Holds no state beyond an optional policy override.
++refund_guard = RefundGuard()
++
++
++__all__ = [
++    "REFUNDABLE_STATUSES",
++    "RefundGuard",
++    "RefundVerdict",
++    "refund_guard",
++    "refundable_paise",
++]
+-- 
+2.43.0
+
+
+From 075c8873c224605315e1addb4d2378b5199ecab8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 5/6] feat(api): policy dry-run and authorization routes, plus
+ the migration
+
+POST /policy/evaluate answers what the gate would say without creating
+anything - so a console can warn 'this needs two approvals' before the
+operator commits. Limited to POLICY_EVALUATE: the response enumerates
+ceilings and thresholds, which would otherwise make it a binary search for
+the largest amount that slips through unattended.
+
+POST/GET/approve on /authorizations. No request model carries merchant_id or
+actor_id; both come from the verified token, which is what makes four-eyes
+enforceable rather than advisory. Money is StrictInt paise throughout.
+
+Refunds are routed through the guard first, so an ineligible refund never
+becomes a pending approval sitting in somebody's queue.
+
+The migration extends authorizations rather than adding a table - the 0001
+spend-cap form and this approval-workflow form are the same object at
+different stages, and splitting them means two places to look during an
+incident. Adds risk_scores (with RLS) and orders.refunded_paise, the running
+total the guard subtracts from.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/routers/authorizations.py                | 167 ++++++++++++++++
+ api/routers/policy.py                        | 105 ++++++++++
+ api/routers/router.py                        |   2 +
+ api/schemas/policy.py                        | 181 +++++++++++++++++
+ db/migrations/0003_policy_authorizations.sql | 196 +++++++++++++++++++
+ 5 files changed, 651 insertions(+)
+ create mode 100644 api/routers/authorizations.py
+ create mode 100644 api/routers/policy.py
+ create mode 100644 api/schemas/policy.py
+ create mode 100644 db/migrations/0003_policy_authorizations.sql
+
+diff --git a/api/routers/authorizations.py b/api/routers/authorizations.py
+new file mode 100644
+index 0000000..186e5f6
+--- /dev/null
++++ b/api/routers/authorizations.py
+@@ -0,0 +1,167 @@
++"""Authorizations: request, read, approve.
++
++Three routes, and the split between them is the separation of duties that
++Phase 5 exists to enforce.
++
++``POST /authorizations``          asks for permission to move money
++``GET  /authorizations/{id}``     reads the record and its approval state
++``POST /authorizations/{id}/approve``  adds one human's blessing
++
++Each carries a different permission, so the party that asks is not necessarily
++the party that approves, and an investigator can read everything while
++approving nothing. The service enforces the rest - no self-approval, no
++approver counted twice - because a rule that lived only in a route would not
++apply to the background jobs that call the same service in later phases.
++
++**On status codes.** ``POST /authorizations`` answers 201 even when policy
++denied the action. The record was created; the verdict is in its ``status``
++field. A denial is not a malformed request, and answering 4xx would conflate
++"you asked wrongly" with "the answer is no" - two things a client must handle
++differently. Nothing depends on the client reading the code correctly, because
++the gate is ``consume``, not the HTTP response.
++"""
++
++from __future__ import annotations
++
++from typing import Annotated, Any
++
++from fastapi import APIRouter, Depends
++
++from core.exceptions import ValidationError
++from core.rbac import Permission
++from dependencies.auth import CurrentUser, require_perm
++from modules.authorization.service import AuthorizationService
++from modules.refunds.guard import RefundGuard
++from policy.models import ActionKind, FinancialAction
++from repositories.orders import OrderRepository
++from routers.policy import build_action
++from schemas.policy import ActionRequest, AuthorizationApproveRequest, AuthorizationOut
++
++router = APIRouter(prefix="/api/v1/authorizations", tags=["authorizations"])
++
++
++def get_authorization_service() -> AuthorizationService:
++    return AuthorizationService()
++
++
++ServiceDep = Annotated[AuthorizationService, Depends(get_authorization_service)]
++
++
++async def _refund_action(
++    body: ActionRequest, *, merchant_id: str, actor_id: str, role: str
++) -> FinancialAction:
++    """Build a refund action from the *order*, not from the request body.
++
++    The refund guard runs first, and an ineligible refund never reaches the
++    authorization gate at all. That ordering is deliberate: an authorization
++    record for a refund that was never going to be permitted is a pending
++    approval sitting in somebody's queue, and approving it would achieve
++    nothing except to teach approvers that the queue contains noise.
++
++    Captured and already-refunded amounts are read off the stored order. They
++    are the two numbers the refund ceiling is computed from, so a caller able
++    to supply them could name a larger capture and refund against it.
++    """
++    order = await OrderRepository().get(body.subject_id)
++    verdict = RefundGuard().evaluate(
++        order=order, merchant_id=merchant_id, amount_paise=body.amount_paise
++    )
++    if not verdict.eligible:
++        raise ValidationError(
++            "REFUND_NOT_ELIGIBLE",
++            "; ".join(verdict.reasons) or "refund is not eligible",
++            verdict.to_dict(),
++        )
++
++    assert order is not None  # noqa: S101 - eligibility already proved it exists
++    return RefundGuard.to_action(
++        order=order,
++        merchant_id=merchant_id,
++        amount_paise=body.amount_paise,
++        actor_id=actor_id,
++        actor_role=role,
++        actions_last_hour=body.context.actions_last_hour,
++        today_total_paise=body.context.today_total_paise,
++    )
++
++
++@router.post(
++    "",
++    response_model=AuthorizationOut,
++    status_code=201,
++    dependencies=[Depends(require_perm(Permission.AUTHORIZATION_REQUEST))],
++)
++async def create_authorization(
++    body: ActionRequest, principal: CurrentUser, service: ServiceDep
++) -> Any:
++    """Run Policy -> Risk -> Authorization and record the outcome.
++
++    The returned ``status`` is one of:
++
++    ``approved``  low risk and every rule passed; nothing else is needed
++    ``pending``   ``required_approvals`` humans must still say yes
++    ``denied``    a rule was broken; no approval can rescue it
++    """
++    if body.kind == ActionKind.REFUND.value:
++        action = await _refund_action(
++            body,
++            merchant_id=principal.merchant_id,
++            actor_id=principal.user_id,
++            role=principal.role,
++        )
++    else:
++        action = build_action(
++            body,
++            merchant_id=principal.merchant_id,
++            actor_id=principal.user_id,
++            role=principal.role,
++        )
++
++    return await service.request(action, tenant_id=principal.tenant_id)
++
++
++@router.get(
++    "/{authorization_id}",
++    response_model=AuthorizationOut,
++    dependencies=[Depends(require_perm(Permission.AUTHORIZATION_READ))],
++)
++async def get_authorization(
++    authorization_id: str, principal: CurrentUser, service: ServiceDep
++) -> Any:
++    """Read one record, scoped to the caller's merchant.
++
++    A record belonging to another merchant answers 404, the same as one that
++    does not exist. Distinguishing them would let an attacker confirm which
++    authorization ids are real by reading the status code.
++    """
++    return await service.get(authorization_id, merchant_id=principal.merchant_id)
++
++
++@router.post(
++    "/{authorization_id}/approve",
++    response_model=AuthorizationOut,
++    dependencies=[Depends(require_perm(Permission.AUTHORIZATION_APPROVE))],
++)
++async def approve_authorization(
++    authorization_id: str,
++    body: AuthorizationApproveRequest,
++    principal: CurrentUser,
++    service: ServiceDep,
++) -> Any:
++    """Add this caller's approval.
++
++    The approver is the token holder. There is no field to name someone else,
++    which is what makes the four-eyes rule enforceable rather than advisory:
++    an approval can only ever be attributed to whoever presented the
++    credential.
++
++    Returns the record with the approval appended. When that approval completes
++    the quorum, the status is ``approved`` and the authorization becomes
++    spendable - once.
++    """
++    return await service.approve(
++        authorization_id,
++        merchant_id=principal.merchant_id,
++        approver_id=principal.user_id,
++        approver_role=principal.role,
++    )
+diff --git a/api/routers/policy.py b/api/routers/policy.py
+new file mode 100644
+index 0000000..f9df080
+--- /dev/null
++++ b/api/routers/policy.py
+@@ -0,0 +1,105 @@
++"""Policy evaluation, as a dry run.
++
++One endpoint, and it deliberately creates nothing. ``POST /policy/evaluate``
++answers "what would the gate say?" - which rules fire, what the risk score
++comes to, how many approvals it would need - without opening an authorization
++or moving anything.
++
++Two audiences. An operator console that wants to warn "this refund will need
++two approvals" before the operator commits to asking. And whoever is changing
++merchant policy, who needs to replay real traffic shapes against a new limit
++before it goes live, which is otherwise done by deploying it and watching what
++breaks.
++
++Access is limited on purpose. The response enumerates a merchant's limits -
++ceilings, escalation thresholds, daily caps - so an unrestricted evaluate
++endpoint is a binary-search oracle for finding the largest amount that slips
++through unattended. ``POLICY_EVALUATE`` is held by manager, admin and service
++accounts, and never by a shopper.
++"""
++
++from __future__ import annotations
++
++from fastapi import APIRouter, Depends
++
++from config.policy import load_merchant_policy
++from core.rbac import Permission
++from dependencies.auth import CurrentUser, require_perm
++from modules.authorization.service import AuthorizationService
++from modules.risk.service import RiskService
++from policy.engine import PolicyEngine
++from policy.models import ActionKind, FinancialAction
++from schemas.policy import ActionRequest, PolicyEvaluateResponse
++
++router = APIRouter(prefix="/api/v1/policy", tags=["policy"])
++
++
++def build_action(body: ActionRequest, *, merchant_id: str, actor_id: str, role: str):
++    """Assemble the action from the body plus the *token*.
++
++    Merchant and actor come from the verified principal, never from the
++    request. This function is the single place that mapping happens, so a new
++    route cannot accidentally take either from a body field.
++    """
++    ctx = body.context
++    return FinancialAction(
++        kind=ActionKind(body.kind),
++        merchant_id=merchant_id,
++        amount_paise=body.amount_paise,
++        currency=body.currency,
++        subject_id=body.subject_id,
++        actor_id=actor_id,
++        actor_role=role,
++        today_total_paise=ctx.today_total_paise,
++        actions_last_hour=ctx.actions_last_hour,
++        captured_paise=ctx.captured_paise,
++        already_refunded_paise=ctx.already_refunded_paise,
++        buyer_age_days=ctx.buyer_age_days,
++        buyer_prior_orders=ctx.buyer_prior_orders,
++        buyer_country=ctx.buyer_country.upper(),
++        ip_country=ctx.ip_country.upper(),
++    )
++
++
++@router.post(
++    "/evaluate",
++    response_model=PolicyEvaluateResponse,
++    dependencies=[Depends(require_perm(Permission.POLICY_EVALUATE))],
++)
++async def evaluate(body: ActionRequest, principal: CurrentUser) -> PolicyEvaluateResponse:
++    """Evaluate an action without creating an authorization.
++
++    Answers 200 whatever the verdict, including a denial. The verdict is the
++    payload, not the status: a caller asking "what would happen?" got a
++    complete answer, and returning 4xx for "policy would refuse this" would
++    make a successful query indistinguishable from a malformed one.
++    """
++    action = build_action(
++        body,
++        merchant_id=principal.merchant_id,
++        actor_id=principal.user_id,
++        role=principal.role,
++    )
++
++    decision = PolicyEngine().evaluate_action(action)
++    if decision.denied:
++        # Mirrors the real path exactly: on a denial the scorer is not run, so
++        # the dry run must not report a score the live gate would never have
++        # computed.
++        return PolicyEvaluateResponse(
++            decision=decision.model_dump(mode="json"),
++            risk=None,
++            required_approvals=0,
++            would_auto_approve=False,
++        )
++
++    assessment = RiskService().assess(action)
++    required = AuthorizationService.required_approvals(
++        decision, assessment, load_merchant_policy(principal.merchant_id)
++    )
++    return PolicyEvaluateResponse(
++        decision=decision.model_dump(mode="json"),
++        risk=assessment.to_dict(),
++        required_approvals=required,
++        would_auto_approve=required == 0,
++    )
+diff --git a/api/routers/router.py b/api/routers/router.py
+index b19327c..1696d81 100644
+--- a/api/routers/router.py
++++ b/api/routers/router.py
+@@ -43,6 +43,8 @@ REGISTRY: list[Mount] = [
+     Mount("routers.carts", description="carts and checkout (phase 4)"),
+     Mount("routers.sessions", description="agentic checkout sessions"),
+     Mount("routers.orders", description="orders"),
++    Mount("routers.policy", description="policy dry-run evaluation (phase 5)"),
++    Mount("routers.authorizations", description="the money gate (phase 5)"),
+     Mount("routers.admin", description="escalations, policy"),
+     Mount("routers.webhooks", description="razorpay callbacks"),
+     Mount("routers.metrics", flag="enable_metrics", description="prometheus scrape"),
+diff --git a/api/schemas/policy.py b/api/schemas/policy.py
+new file mode 100644
+index 0000000..35d2f5a
+--- /dev/null
++++ b/api/schemas/policy.py
+@@ -0,0 +1,181 @@
++"""Wire shapes for the policy, risk and authorization endpoints.
++
++Two rules govern everything in this file.
++
++**Money is ``StrictInt`` paise.** Pydantic will happily coerce ``249.9`` into an
++``int`` field by truncation, turning one amount into a different amount with no
++error anywhere. Every paise field here refuses a float at the edge.
++
++**Identity is never a body field.** There is no ``merchant_id`` and no
++``actor_id`` on any request model. Both come from the verified token in the
++router. A body that could name its own merchant is a cross-tenant write waiting
++to be discovered, and a body that could name its own actor makes the four-eyes
++rule unenforceable - the requester would simply claim to be somebody else.
++
++The context fields (velocity counters, buyer history, geography) *are* accepted
++from the caller, because in this phase the caller is the internal service that
++holds them. They are inputs to a score, never to a permission: the worst a
++dishonest context can do is inflate the number of approvals required, which
++fails safe. Phase 6 moves them server-side when the counters exist.
++"""
++
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any, Literal
++
++from pydantic import BaseModel, ConfigDict, Field, StrictInt
++
++ActionKindLiteral = Literal["payment", "refund", "payout", "campaign_spend"]
++
++
++class ActionContext(BaseModel):
++    """Everything the rules and the scorer read, other than the action itself.
++
++    Defaults describe an unremarkable transaction by an established buyer, so a
++    caller that supplies nothing gets a clean baseline rather than an accidental
++    high-risk score from zeroed history.
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    today_total_paise: StrictInt = Field(default=0, ge=0)
++    actions_last_hour: StrictInt = Field(default=0, ge=0)
++    captured_paise: StrictInt = Field(default=0, ge=0)
++    already_refunded_paise: StrictInt = Field(default=0, ge=0)
++    buyer_age_days: StrictInt = Field(default=365, ge=0)
++    buyer_prior_orders: StrictInt = Field(default=10, ge=0)
++    buyer_country: str = Field(default="IN", min_length=2, max_length=2)
++    ip_country: str = Field(default="IN", min_length=2, max_length=2)
++
++
++class ActionRequest(BaseModel):
++    """One financial action, as a caller describes it."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    kind: ActionKindLiteral
++    amount_paise: StrictInt = Field(ge=0)
++    subject_id: str = Field(min_length=1, max_length=128)
++    currency: Literal["INR"] = "INR"
++    context: ActionContext = Field(default_factory=ActionContext)
++
++
++class RuleResultOut(BaseModel):
++    rule_id: str
++    outcome: Literal["allow", "escalate", "deny"]
++    message: str = ""
++    details: dict[str, Any] = Field(default_factory=dict)
++
++
++class PolicyDecisionOut(BaseModel):
++    decision_id: str
++    outcome: Literal["allow", "escalate", "deny"]
++    action_kind: ActionKindLiteral
++    amount_paise: int
++    action_fingerprint: str
++    reasons: list[str] = Field(default_factory=list)
++    rule_results: list[RuleResultOut] = Field(default_factory=list)
++    policy_version: str
++    metadata: dict[str, Any] = Field(default_factory=dict)
++
++
++class RiskOut(BaseModel):
++    score: float
++    band: Literal["low", "medium", "high"]
++    signals: list[str] = Field(default_factory=list)
++    components: dict[str, float] = Field(default_factory=dict)
++    metadata: dict[str, Any] = Field(default_factory=dict)
++
++
++class PolicyEvaluateResponse(BaseModel):
++    """A dry run of the gate.
++
++    Carries what *would* happen without creating anything. Useful for a UI that
++    wants to warn "this will need two approvals" before the operator commits,
++    and for testing a policy change against real traffic shapes.
++
++    ``risk`` is null when policy denied: a denial is categorical and the scorer
++    is not consulted, so reporting a score would imply a weighing that did not
++    happen.
++    """
++
++    decision: PolicyDecisionOut
++    risk: RiskOut | None = None
++    required_approvals: int
++    would_auto_approve: bool
++
++
++class ApproverOut(BaseModel):
++    approver_id: str
++    role: str
++    at: datetime
++
++
++class AuthorizationOut(BaseModel):
++    """An authorization record as the API reports it.
++
++    ``policy_decision`` and ``risk`` are included in full rather than
++    summarised. This record is the audit trail for a money movement, and a
++    summary is the thing you discover is missing a field on the day you need
++    it in a dispute.
++    """
++
++    id: str
++    merchant_id: str
++    action_kind: ActionKindLiteral
++    amount_paise: int
++    currency: str
++    subject_id: str
++    action_fingerprint: str
++    requested_by: str
++    requested_by_role: str
++    status: Literal["pending", "approved", "denied", "consumed", "expired", "revoked"]
++    required_approvals: int
++    approvers: list[ApproverOut] = Field(default_factory=list)
++    reasons: list[str] = Field(default_factory=list)
++    policy_decision: dict[str, Any] = Field(default_factory=dict)
++    risk: dict[str, Any] = Field(default_factory=dict)
++    created_at: datetime
++    expires_at: datetime | None = None
++    approved_at: datetime | None = None
++    consumed_at: datetime | None = None
++
++    @property
++    def approvals_outstanding(self) -> int:
++        return max(0, self.required_approvals - len(self.approvers))
++
++
++class AuthorizationApproveRequest(BaseModel):
++    """The approver's identity is not here - it comes from their token.
++
++    A note is optional and is the approver's own words about why they approved.
++    It is stored, never parsed: nothing branches on it.
++    """
++
++    model_config = ConfigDict(extra="forbid")
++
++    note: str | None = Field(default=None, max_length=1000)
++
++
++class RefundEligibilityOut(BaseModel):
++    eligible: bool
++    max_refundable_paise: int
++    reasons: list[str] = Field(default_factory=list)
++    requires_authorization: bool = False
++    details: dict[str, Any] = Field(default_factory=dict)
++
++
++__all__ = [
++    "ActionContext",
++    "ActionKindLiteral",
++    "ActionRequest",
++    "ApproverOut",
++    "AuthorizationApproveRequest",
++    "AuthorizationOut",
++    "PolicyDecisionOut",
++    "PolicyEvaluateResponse",
++    "RefundEligibilityOut",
++    "RiskOut",
++    "RuleResultOut",
++]
+diff --git a/db/migrations/0003_policy_authorizations.sql b/db/migrations/0003_policy_authorizations.sql
+new file mode 100644
+index 0000000..cef60ac
+--- /dev/null
++++ b/db/migrations/0003_policy_authorizations.sql
+@@ -0,0 +1,196 @@
++-- =============================================================================
++-- 0003 - Policy, risk and authorization (phase 5)
++-- =============================================================================
++-- Apply with: psql $DATABASE_URL -f db/migrations/0003_policy_authorizations.sql
++--
++-- Idempotent throughout: every statement is IF NOT EXISTS or guarded in a DO
++-- block. A migration that only works on a database it has never touched is a
++-- migration you cannot re-run after a partial failure, which is exactly when
++-- you need to.
++--
++-- WHY THIS EXTENDS `authorizations` RATHER THAN ADDING A TABLE
++--
++-- The table already exists from 0001, holding the scoped spend-cap form of an
++-- authorization (session, max amount, consumed amount). Phase 5 adds the
++-- approval-workflow form on top: a policy decision, a risk score, a required
++-- number of approvals, and the people who gave them. They are the same object
++-- at different stages of its life - "permission to move this money" - and
++-- splitting them across two tables would mean two places to look when
++-- answering the only question that matters during an incident: was this
++-- payment authorized, and by whom?
++--
++-- The 0001 columns are relaxed to nullable rather than dropped. Existing rows
++-- keep their meaning, and the two shapes coexist while phase 6 migrates the
++-- payment path over.
++
++BEGIN;
++
++-- --- authorizations: the phase 5 columns -------------------------------------
++
++ALTER TABLE authorizations
++    ADD COLUMN IF NOT EXISTS tenant_id           UUID,
++    ADD COLUMN IF NOT EXISTS merchant_id         VARCHAR(64),
++    ADD COLUMN IF NOT EXISTS action_kind         VARCHAR(32),
++    ADD COLUMN IF NOT EXISTS amount_paise        BIGINT,
++    ADD COLUMN IF NOT EXISTS currency            VARCHAR(3)   NOT NULL DEFAULT 'INR',
++    -- What the money is about: an order id, a payout id, a campaign id.
++    ADD COLUMN IF NOT EXISTS subject_id          VARCHAR(128),
++    -- SHA256 over (kind, merchant, amount, currency, subject). An approval is
++    -- spendable only against an action that hashes to the same value, which is
++    -- what stops an approval for a small amount being presented for a large
++    -- one. Indexed, not unique: an expired authorization may legitimately be
++    -- re-requested for the same action.
++    ADD COLUMN IF NOT EXISTS action_fingerprint  CHAR(64),
++    ADD COLUMN IF NOT EXISTS requested_by        VARCHAR(64),
++    ADD COLUMN IF NOT EXISTS requested_by_role   VARCHAR(32),
++    ADD COLUMN IF NOT EXISTS status              VARCHAR(16),
++    ADD COLUMN IF NOT EXISTS required_approvals  SMALLINT     NOT NULL DEFAULT 0,
++    -- [{approver_id, role, at}]. An array rather than a child table: it is
++    -- read only with its parent, never queried across authorizations, and a
++    -- join to answer "who approved this" is a join nobody needs.
++    ADD COLUMN IF NOT EXISTS approvers           JSONB        NOT NULL DEFAULT '[]'::jsonb,
++    -- The full decision, rules and all. Stored rather than recomputed: the
++    -- policy version that judged this action may no longer exist, and a
++    -- decision you can only reproduce under the current policy is not evidence
++    -- of what was decided under the old one.
++    ADD COLUMN IF NOT EXISTS policy_decision     JSONB        NOT NULL DEFAULT '{}'::jsonb,
++    ADD COLUMN IF NOT EXISTS risk                JSONB        NOT NULL DEFAULT '{}'::jsonb,
++    ADD COLUMN IF NOT EXISTS reasons             JSONB        NOT NULL DEFAULT '[]'::jsonb,
++    ADD COLUMN IF NOT EXISTS created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
++    ADD COLUMN IF NOT EXISTS updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
++    ADD COLUMN IF NOT EXISTS approved_at         TIMESTAMPTZ,
++    ADD COLUMN IF NOT EXISTS consumed_at         TIMESTAMPTZ;
++
++-- The 0001 shape required a session, a scope and a spend cap. A phase 5 record
++-- has none of those - it authorizes one specific action, not a budget - so the
++-- constraints are relaxed rather than worked around with placeholder values.
++-- Placeholder values are how a NOT NULL column ends up full of zeroes that
++-- later code mistakes for real limits.
++ALTER TABLE authorizations ALTER COLUMN scope            DROP NOT NULL;
++ALTER TABLE authorizations ALTER COLUMN max_amount_paise DROP NOT NULL;
++-- A denied authorization has no expiry: it is terminal on creation, and an
++-- expiry would imply a window in which it could have been used.
++ALTER TABLE authorizations ALTER COLUMN expires_at       DROP NOT NULL;
++
++DO $$
++BEGIN
++    -- Status is a closed set, enforced by the database and not only by the
++    -- application. The application is one deploy away from a typo; a row that
++    -- said 'aproved' would be permanently unspendable and silently so.
++    IF NOT EXISTS (
++        SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_status_valid'
++    ) THEN
++        ALTER TABLE authorizations ADD CONSTRAINT authorizations_status_valid
++            CHECK (status IS NULL OR status IN (
++                'pending', 'approved', 'denied', 'consumed', 'expired', 'revoked'
++            ));
++    END IF;
++
++    IF NOT EXISTS (
++        SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_approvals_sane'
++    ) THEN
++        ALTER TABLE authorizations ADD CONSTRAINT authorizations_approvals_sane
++            CHECK (required_approvals >= 0 AND required_approvals <= 10);
++    END IF;
++
++    -- Money moved must be positive where it is recorded at all. The 0001
++    -- column keeps its own check; this one covers the phase 5 column.
++    IF NOT EXISTS (
++        SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_amount_positive'
++    ) THEN
++        ALTER TABLE authorizations ADD CONSTRAINT authorizations_amount_positive
++            CHECK (amount_paise IS NULL OR amount_paise > 0);
++    END IF;
++
++    -- An approved or consumed record must carry the timestamp that says so.
++    -- Without this, "approved" is a string nobody can date, and reconstructing
++    -- an approval timeline after the fact becomes guesswork.
++    IF NOT EXISTS (
++        SELECT 1 FROM pg_constraint WHERE conname = 'authorizations_timestamps_agree'
++    ) THEN
++        ALTER TABLE authorizations ADD CONSTRAINT authorizations_timestamps_agree
++            CHECK (
++                (status <> 'approved' OR approved_at IS NOT NULL)
++                AND (status <> 'consumed' OR consumed_at IS NOT NULL)
++            );
++    END IF;
++END
++$$;
++
++-- The approver queue: "what is waiting on me, oldest first".
++CREATE INDEX IF NOT EXISTS idx_authorizations_pending
++    ON authorizations (tenant_id, status, created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_authorizations_merchant_status
++    ON authorizations (merchant_id, status);
++CREATE INDEX IF NOT EXISTS idx_authorizations_fingerprint
++    ON authorizations (action_fingerprint);
++CREATE INDEX IF NOT EXISTS idx_authorizations_subject
++    ON authorizations (subject_id);
++
++-- --- risk_scores -------------------------------------------------------------
++-- Every score, kept whether or not it changed anything. The scores that led to
++-- *no* action are the ones a model review needs: they are the negative class,
++-- and without them the only measurable rate is the false-positive one.
++
++CREATE TABLE IF NOT EXISTS risk_scores (
++    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
++    tenant_id         UUID,
++    merchant_id       VARCHAR(64)  NOT NULL,
++    authorization_id  UUID REFERENCES authorizations(id) ON DELETE SET NULL,
++    action_kind       VARCHAR(32)  NOT NULL,
++    subject_id        VARCHAR(128),
++    amount_paise      BIGINT       NOT NULL CHECK (amount_paise >= 0),
++    -- NUMERIC, not DOUBLE PRECISION. A float score does not compare equal to
++    -- itself across a round trip, and band edges are exactly the comparisons
++    -- that would silently disagree with the application's.
++    score             NUMERIC(5,4) NOT NULL CHECK (score >= 0 AND score <= 1),
++    band              VARCHAR(8)   NOT NULL CHECK (band IN ('low', 'medium', 'high')),
++    signals           JSONB        NOT NULL DEFAULT '[]'::jsonb,
++    components        JSONB        NOT NULL DEFAULT '{}'::jsonb,
++    policy_version    VARCHAR(32),
++    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS idx_risk_scores_tenant_created
++    ON risk_scores (tenant_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_risk_scores_authorization
++    ON risk_scores (authorization_id);
++CREATE INDEX IF NOT EXISTS idx_risk_scores_band
++    ON risk_scores (merchant_id, band, created_at DESC);
++
++-- --- orders: refund accounting ----------------------------------------------
++-- The refund guard subtracts this from the captured amount. Without a stored
++-- running total, "how much has already gone back?" is a SUM over a refunds
++-- table that does not exist yet, and the guard would compute a ceiling from
++-- zero every time - which is how the same money is refunded twice.
++
++ALTER TABLE orders
++    ADD COLUMN IF NOT EXISTS refunded_paise BIGINT NOT NULL DEFAULT 0;
++
++DO $$
++BEGIN
++    IF NOT EXISTS (
++        SELECT 1 FROM pg_constraint WHERE conname = 'orders_refund_within_capture'
++    ) THEN
++        -- The invariant the guard enforces in code, enforced again here. Code
++        -- can be bypassed by a manual UPDATE at 3am during an incident; this
++        -- cannot.
++        ALTER TABLE orders ADD CONSTRAINT orders_refund_within_capture
++            CHECK (refunded_paise >= 0 AND refunded_paise <= final_amount_paise);
++    END IF;
++END
++$$;
++
++-- --- row level security ------------------------------------------------------
++-- Same fail-closed policy as every other tenant-owned table: an unpinned query
++-- returns zero rows rather than someone else's. `authorizations` was already
++-- covered by 0001; `risk_scores` is new and must be enrolled, or it would be
++-- the one table in the deployment readable across tenants.
++
++ALTER TABLE risk_scores ENABLE ROW LEVEL SECURITY;
++DROP POLICY IF EXISTS tenant_isolation ON risk_scores;
++CREATE POLICY tenant_isolation ON risk_scores
++    USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)
++    WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid);
++
++COMMIT;
+-- 
+2.43.0
+
+
+From 2249d378ee225f2da28e6fb7d0a9d56c7a493e8c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 3 Sep 2026 22:22:26 +0000
+Subject: [PATCH 6/6] test: policy, risk, refunds, authorization flow and
+ bypass attempts
+
+172 new tests across five files.
+
+The security file is written as an attacker: Phase 5's acceptance is a
+negative claim - no financial action proceeds without a passing decision and
+approval - and a negative claim cannot be shown by the happy path. Each test
+tries to get money out and passes only when it fails: spend a pending record,
+spend a denied one, spend one twice, spend a small approval on a large charge,
+be both approvers, approve your own request, reach another merchant's record,
+use an approval after it died.
+
+The insider is the interesting attacker, so the fixture is a real manager at
+the merchant rather than an outsider.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01M6LL3Gr7HTQxMcJnbbKLzC
+---
+ api/tests/integration/test_app_shell.py       |   9 +-
+ .../integration/test_authorization_flow.py    | 499 ++++++++++++++++++
+ .../security/test_authorization_bypass.py     | 479 +++++++++++++++++
+ api/tests/unit/test_policy_actions.py         | 318 +++++++++++
+ api/tests/unit/test_refund_guard.py           | 268 ++++++++++
+ api/tests/unit/test_risk_service.py           | 287 ++++++++++
+ 6 files changed, 1859 insertions(+), 1 deletion(-)
+ create mode 100644 api/tests/integration/test_authorization_flow.py
+ create mode 100644 api/tests/security/test_authorization_bypass.py
+ create mode 100644 api/tests/unit/test_policy_actions.py
+ create mode 100644 api/tests/unit/test_refund_guard.py
+ create mode 100644 api/tests/unit/test_risk_service.py
+
+diff --git a/api/tests/integration/test_app_shell.py b/api/tests/integration/test_app_shell.py
+index 3c7098b..50f450a 100644
+--- a/api/tests/integration/test_app_shell.py
++++ b/api/tests/integration/test_app_shell.py
+@@ -61,7 +61,14 @@ async def test_app_boots_and_serves_its_schema(client):
+ 
+ def test_router_registry_mounted_everything(app):
+     mounted = app.state.mounted_routers
+-    for expected in ("routers.health", "routers.auth", "routers.carts", "routers.products"):
++    for expected in (
++        "routers.health",
++        "routers.auth",
++        "routers.carts",
++        "routers.products",
++        "routers.policy",
++        "routers.authorizations",
++    ):
+         assert expected in mounted, f"{expected} not mounted: {mounted}"
+ 
+ 
+diff --git a/api/tests/integration/test_authorization_flow.py b/api/tests/integration/test_authorization_flow.py
+new file mode 100644
+index 0000000..834a890
+--- /dev/null
++++ b/api/tests/integration/test_authorization_flow.py
+@@ -0,0 +1,499 @@
++"""Policy -> Risk -> Authorization, through the real HTTP surface.
++
++The Phase 5 acceptance: no financial action proceeds without a passing decision
++and, where required, approval. These tests walk that path as a client would -
++asking for an authorization, collecting approvals, spending it - and check the
++gate at every step.
++
++Tokens are minted directly rather than obtained by logging in. A quorum needs
++two distinct managers, the dev seed has one of each role, and minting is the
++honest way to get two. It also keeps these tests independent of whatever the
++seed happens to contain this month.
++"""
++
++from __future__ import annotations
++
++import pytest
++from httpx import ASGITransport, AsyncClient
++
++from core.jwt import JWTManager
++from modules.authorization.service import AuthorizationService
++from policy.models import ActionKind, FinancialAction
++from repositories.authorizations import AuthorizationRepository, reset_authorizations
++from repositories.orders import OrderRepository
++
++pytestmark = pytest.mark.asyncio
++
++MERCHANT = "merchant_keen"
++TENANT = "11111111-1111-1111-1111-111111111111"
++
++#: Context chosen to score zero risk, so a test that wants a signal has to ask
++#: for it rather than inheriting one by accident.
++QUIET = {
++    "today_total_paise": 0,
++    "actions_last_hour": 0,
++    "buyer_age_days": 900,
++    "buyer_prior_orders": 40,
++    "buyer_country": "IN",
++    "ip_country": "IN",
++}
++
++
++@pytest.fixture(autouse=True)
++def _clean():
++    """Authorizations live in a module-level dict. Without this, tests would
++    see each other's records and pass or fail depending on ordering."""
++    reset_authorizations()
++    yield
++    reset_authorizations()
++
++
++@pytest.fixture
++def app():
++    from main import create_app
++
++    return create_app()
++
++
++@pytest.fixture
++async def client(app):
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
++        yield c
++
++
++def token(user_id: str, role: str, merchant_id: str = MERCHANT) -> dict:
++    jwt = JWTManager().create_access_token(
++        user_id=user_id, merchant_id=merchant_id, role=role, tenant_id=TENANT
++    )
++    return {"Authorization": f"Bearer {jwt}"}
++
++
++@pytest.fixture
++def manager():
++    return token("mgr_alice", "manager")
++
++
++@pytest.fixture
++def second_manager():
++    return token("mgr_bob", "manager")
++
++
++@pytest.fixture
++def admin():
++    return token("adm_root", "admin")
++
++
++@pytest.fixture
++def support():
++    return token("sup_carol", "support_agent")
++
++
++@pytest.fixture
++def shopper():
++    return token("shopper_dave", "shopper")
++
++
++def body(amount: int, *, kind: str = "payment", subject: str = "ord_test1", **ctx) -> dict:
++    return {
++        "kind": kind,
++        "amount_paise": amount,
++        "subject_id": subject,
++        "context": {**QUIET, **ctx},
++    }
++
++
++async def request_auth(client, headers, amount: int, **kwargs):
++    return await client.post(
++        "/api/v1/authorizations", headers=headers, json=body(amount, **kwargs)
++    )
++
++
++async def paid_order(*, amount_paise: int = 100_000, merchant_id: str = MERCHANT) -> dict:
++    """A real captured order, so the refund path has something to reason about."""
++    repo = OrderRepository()
++    order = await repo.create_pending(
++        session_id="00000000-0000-0000-0000-000000000001",
++        merchant_id=merchant_id,
++        user_id="shopper_dave",
++        line_items=[{"sku": "X", "quantity": 1, "unit_price_paise": amount_paise}],
++        subtotal_paise=amount_paise,
++        discount_amount_paise=0,
++        final_amount_paise=amount_paise,
++        guardrail_decision_id="00000000-0000-0000-0000-000000000002",
++        offer_version=1,
++        policy_version="test",
++        idempotency_key="key-abcdefgh",
++        razorpay_payment_link_id="plink_test",
++        razorpay_payment_link_url="https://example.invalid/pay",
++    )
++    return await repo.mark_paid(order["id"], payment_id="pay_test")
++
++
++# --- policy evaluate: the dry run -------------------------------------------
++
++
++async def test_evaluate_reports_an_ordinary_payment_as_auto_approving(client, manager):
++    r = await client.post("/api/v1/policy/evaluate", headers=manager, json=body(250_000))
++    assert r.status_code == 200, r.text
++    payload = r.json()
++    assert payload["decision"]["outcome"] == "allow"
++    assert payload["required_approvals"] == 0
++    assert payload["would_auto_approve"] is True
++    assert payload["risk"]["band"] == "low"
++
++
++async def test_evaluate_warns_before_the_operator_commits(client, manager):
++    """The point of a dry run: "this will need two approvals", said early."""
++    r = await client.post("/api/v1/policy/evaluate", headers=manager, json=body(35_000_000))
++    assert r.json()["required_approvals"] == 2
++    assert r.json()["would_auto_approve"] is False
++
++
++async def test_evaluate_answers_200_even_for_a_denial(client, manager):
++    """A complete answer to "what would happen?" is not a client error."""
++    r = await client.post("/api/v1/policy/evaluate", headers=manager, json=body(999_000_000))
++    assert r.status_code == 200
++    assert r.json()["decision"]["outcome"] == "deny"
++
++
++async def test_a_denied_action_is_not_scored(client, manager):
++    """The live path does not score a denial, so the dry run must not report a
++    score the real gate would never have computed."""
++    r = await client.post("/api/v1/policy/evaluate", headers=manager, json=body(999_000_000))
++    assert r.json()["risk"] is None
++
++
++async def test_evaluate_creates_nothing(client, manager):
++    await client.post("/api/v1/policy/evaluate", headers=manager, json=body(35_000_000))
++    assert await AuthorizationRepository().list_for_merchant(merchant_id=MERCHANT) == []
++
++
++async def test_a_shopper_cannot_probe_the_merchants_limits(client, shopper):
++    """The response enumerates ceilings and thresholds, which would make an open
++    evaluate endpoint a binary search for the largest unattended amount."""
++    r = await client.post("/api/v1/policy/evaluate", headers=shopper, json=body(1_000))
++    assert r.status_code == 403
++
++
++async def test_evaluate_requires_authentication(client):
++    r = await client.post("/api/v1/policy/evaluate", json=body(1_000))
++    assert r.status_code == 401
++
++
++# --- requesting an authorization --------------------------------------------
++
++
++async def test_a_routine_payment_authorizes_without_a_human(client, manager):
++    r = await request_auth(client, manager, 250_000)
++    assert r.status_code == 201, r.text
++    record = r.json()
++    assert record["status"] == "approved"
++    assert record["required_approvals"] == 0
++    assert record["approvers"] == []
++    assert record["approved_at"] is not None
++
++
++async def test_an_escalated_payment_waits_for_one_human(client, manager):
++    r = await request_auth(client, manager, 15_000_000)
++    record = r.json()
++    assert record["status"] == "pending"
++    assert record["required_approvals"] == 1
++
++
++async def test_a_high_risk_payment_needs_a_quorum(client, manager):
++    r = await request_auth(client, manager, 35_000_000)
++    record = r.json()
++    assert record["status"] == "pending"
++    assert record["required_approvals"] == 2
++    assert record["risk"]["band"] == "high"
++
++
++async def test_a_new_buyer_alone_needs_one_approval(client, manager):
++    r = await request_auth(client, manager, 250_000, buyer_age_days=0, buyer_prior_orders=0)
++    assert r.json()["required_approvals"] == 1
++
++
++async def test_a_new_buyer_spending_a_lot_needs_a_quorum(client, manager):
++    """Corroboration: neither signal alone reaches high, together they do."""
++    r = await request_auth(
++        client, manager, 15_000_000, buyer_age_days=0, buyer_prior_orders=0
++    )
++    assert r.json()["required_approvals"] == 2
++
++
++async def test_a_denied_action_still_leaves_a_record(client, manager):
++    """A refusal that left no trace is invisible to whoever investigates why a
++    merchant's payment failed."""
++    r = await request_auth(client, manager, 999_000_000)
++    assert r.status_code == 201
++    record = r.json()
++    assert record["status"] == "denied"
++    assert record["reasons"]
++    assert record["expires_at"] is None, "a denial is terminal, not merely expiring"
++
++
++async def test_the_record_carries_the_full_decision(client, manager):
++    """The audit trail for a money movement. A summary is the thing you find is
++    missing a field on the day you need it in a dispute."""
++    record = (await request_auth(client, manager, 15_000_000)).json()
++    assert record["policy_decision"]["outcome"] == "escalate"
++    assert record["policy_decision"]["rule_results"]
++    assert record["policy_decision"]["policy_version"]
++    assert record["risk"]["components"].keys() >= {"amount", "geography"}
++
++
++async def test_the_requester_is_taken_from_the_token(client, manager):
++    assert (await request_auth(client, manager, 250_000)).json()["requested_by"] == "mgr_alice"
++
++
++async def test_a_shopper_cannot_request_an_authorization(client, shopper):
++    assert (await request_auth(client, shopper, 250_000)).status_code == 403
++
++
++async def test_support_cannot_request_an_authorization(client, support):
++    assert (await request_auth(client, support, 250_000)).status_code == 403
++
++
++async def test_a_float_amount_is_refused_at_the_edge(client, manager):
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers=manager,
++        json={"kind": "payment", "amount_paise": 249.9, "subject_id": "ord_x"},
++    )
++    assert r.status_code == 422
++
++
++async def test_an_unknown_action_kind_is_refused(client, manager):
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers=manager,
++        json={"kind": "wire_transfer", "amount_paise": 100, "subject_id": "ord_x"},
++    )
++    assert r.status_code == 422
++
++
++async def test_the_body_cannot_name_its_own_merchant(client, manager):
++    """extra='forbid'. A body that could name its merchant is a cross-tenant
++    write waiting to be found."""
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers=manager,
++        json={
++            "kind": "payment",
++            "amount_paise": 100,
++            "subject_id": "ord_x",
++            "merchant_id": "merchant_acme",
++        },
++    )
++    assert r.status_code == 422
++
++
++# --- reading ----------------------------------------------------------------
++
++
++async def test_an_authorization_can_be_read_back(client, manager):
++    created = (await request_auth(client, manager, 15_000_000)).json()
++    r = await client.get(f"/api/v1/authorizations/{created['id']}", headers=manager)
++    assert r.status_code == 200
++    assert r.json()["id"] == created["id"]
++
++
++async def test_support_may_read_but_not_approve(client, manager, support):
++    """Separation of duties: an investigator sees everything, approves nothing."""
++    created = (await request_auth(client, manager, 15_000_000)).json()
++    assert (
++        await client.get(f"/api/v1/authorizations/{created['id']}", headers=support)
++    ).status_code == 200
++    assert (
++        await client.post(
++            f"/api/v1/authorizations/{created['id']}/approve", headers=support, json={}
++        )
++    ).status_code == 403
++
++
++async def test_an_unknown_authorization_is_404(client, manager):
++    r = await client.get("/api/v1/authorizations/auth_nope", headers=manager)
++    assert r.status_code == 404
++
++
++# --- approving --------------------------------------------------------------
++
++
++async def test_one_approval_completes_a_single_approver_requirement(
++    client, manager, second_manager
++):
++    created = (await request_auth(client, manager, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{created['id']}/approve",
++        headers=second_manager,
++        json={"note": "checked against the invoice"},
++    )
++    assert r.status_code == 200, r.text
++    assert r.json()["status"] == "approved"
++    assert len(r.json()["approvers"]) == 1
++
++
++async def test_a_quorum_needs_two_distinct_people(client, manager, second_manager, admin):
++    created = (await request_auth(client, manager, 35_000_000)).json()
++    auth_id = created["id"]
++
++    first = await client.post(
++        f"/api/v1/authorizations/{auth_id}/approve", headers=second_manager, json={}
++    )
++    assert first.status_code == 200
++    assert first.json()["status"] == "pending", "one approval is not a quorum of two"
++
++    second = await client.post(
++        f"/api/v1/authorizations/{auth_id}/approve", headers=admin, json={}
++    )
++    assert second.status_code == 200
++    assert second.json()["status"] == "approved"
++    assert len(second.json()["approvers"]) == 2
++
++
++async def test_an_approver_is_recorded_by_name_and_role(client, manager, second_manager):
++    created = (await request_auth(client, manager, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{created['id']}/approve", headers=second_manager, json={}
++    )
++    approver = r.json()["approvers"][0]
++    assert approver["approver_id"] == "mgr_bob"
++    assert approver["role"] == "manager"
++    assert approver["at"]
++
++
++async def test_approving_an_already_approved_record_is_a_conflict(
++    client, manager, second_manager, admin
++):
++    created = (await request_auth(client, manager, 15_000_000)).json()
++    await client.post(
++        f"/api/v1/authorizations/{created['id']}/approve", headers=second_manager, json={}
++    )
++    again = await client.post(
++        f"/api/v1/authorizations/{created['id']}/approve", headers=admin, json={}
++    )
++    assert again.status_code == 409
++    assert again.json()["error"]["code"] == "AUTHORIZATION_NOT_PENDING"
++
++
++async def test_approving_a_denied_record_is_refused(client, manager, second_manager):
++    """Nobody may approve past a denial - that is the whole difference between
++    a denial and an escalation."""
++    created = (await request_auth(client, manager, 999_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{created['id']}/approve", headers=second_manager, json={}
++    )
++    assert r.status_code == 409
++    assert r.json()["error"]["code"] == "AUTHORIZATION_DENIED"
++
++
++# --- refunds, through the guard ---------------------------------------------
++
++
++async def test_a_small_refund_on_a_paid_order_authorizes(client, manager):
++    order = await paid_order(amount_paise=100_000)
++    r = await request_auth(client, manager, 50_000, kind="refund", subject=order["id"])
++    assert r.status_code == 201, r.text
++    assert r.json()["status"] == "approved"
++    assert r.json()["action_kind"] == "refund"
++
++
++async def test_a_refund_larger_than_the_capture_never_reaches_the_gate(client, manager):
++    """An authorization for a refund that was never going to be permitted is a
++    pending approval sitting in somebody's queue for no reason."""
++    order = await paid_order(amount_paise=100_000)
++    r = await request_auth(client, manager, 100_001, kind="refund", subject=order["id"])
++    assert r.status_code == 422
++    assert r.json()["error"]["code"] == "REFUND_NOT_ELIGIBLE"
++    assert await AuthorizationRepository().list_for_merchant(merchant_id=MERCHANT) == []
++
++
++async def test_a_refund_against_an_unknown_order_is_refused(client, manager):
++    r = await request_auth(client, manager, 1_000, kind="refund", subject="ord_nope")
++    assert r.status_code == 422
++    assert "order not found" in r.text
++
++
++async def test_a_refund_against_another_merchants_order_is_refused(client, manager):
++    """Same answer as an unknown order: confirming an id belongs to someone
++    maps another merchant's order numbers."""
++    order = await paid_order(merchant_id="merchant_acme")
++    r = await request_auth(client, manager, 1_000, kind="refund", subject=order["id"])
++    assert r.status_code == 422
++    assert "order not found" in r.text
++
++
++async def test_a_large_refund_escalates_sooner_than_a_payment_would(client, manager):
++    amount = 3_000_000  # over the refund threshold, under the payment one
++    order = await paid_order(amount_paise=amount)
++    refund = (
++        await request_auth(client, manager, amount, kind="refund", subject=order["id"])
++    ).json()
++    payment = (await request_auth(client, manager, amount)).json()
++
++    assert refund["status"] == "pending"
++    assert payment["status"] == "approved"
++
++
++# --- spending the authorization ---------------------------------------------
++# consume() has no route of its own in this phase: it is the seam the payment
++# path calls in phase 6. Exercised directly, because it is the gate.
++
++
++def action_for(record: dict, *, amount: int | None = None) -> FinancialAction:
++    return FinancialAction(
++        kind=ActionKind(record["action_kind"]),
++        merchant_id=record["merchant_id"],
++        amount_paise=amount if amount is not None else record["amount_paise"],
++        subject_id=record["subject_id"],
++        actor_id=record["requested_by"],
++        actor_role=record["requested_by_role"],
++    )
++
++
++async def test_an_approved_authorization_can_be_spent(client, manager):
++    record = (await request_auth(client, manager, 250_000)).json()
++    spent = await AuthorizationService().consume(
++        record["id"], merchant_id=MERCHANT, action=action_for(record)
++    )
++    assert spent["status"] == "consumed"
++    assert spent["consumed_at"] is not None
++
++
++async def test_spending_twice_is_refused(client, manager):
++    """Single use. The second attempt is a double charge."""
++    record = (await request_auth(client, manager, 250_000)).json()
++    service = AuthorizationService()
++    await service.consume(record["id"], merchant_id=MERCHANT, action=action_for(record))
++
++    from core.exceptions import ConflictError
++
++    with pytest.raises(ConflictError) as exc:
++        await service.consume(record["id"], merchant_id=MERCHANT, action=action_for(record))
++    assert exc.value.code == "AUTHORIZATION_ALREADY_CONSUMED"
++
++
++async def test_a_quorum_authorization_is_spendable_only_after_both_approvals(
++    client, manager, second_manager, admin
++):
++    from core.exceptions import ConflictError
++
++    record = (await request_auth(client, manager, 35_000_000)).json()
++    service = AuthorizationService()
++
++    with pytest.raises(ConflictError):
++        await service.consume(record["id"], merchant_id=MERCHANT, action=action_for(record))
++
++    await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=second_manager, json={}
++    )
++    with pytest.raises(ConflictError):
++        await service.consume(record["id"], merchant_id=MERCHANT, action=action_for(record))
++
++    await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=admin, json={}
++    )
++    spent = await service.consume(
++        record["id"], merchant_id=MERCHANT, action=action_for(record)
++    )
++    assert spent["status"] == "consumed"
+diff --git a/api/tests/security/test_authorization_bypass.py b/api/tests/security/test_authorization_bypass.py
+new file mode 100644
+index 0000000..f619e33
+--- /dev/null
++++ b/api/tests/security/test_authorization_bypass.py
+@@ -0,0 +1,479 @@
++"""Red team: every way to move money without a valid authorization.
++
++Phase 5's acceptance is a negative claim - *no* financial action proceeds
++without a passing decision and, where required, approval. A negative claim
++cannot be demonstrated by the happy path, so this file is written as an
++attacker: each test is an attempt to get money out, and passes only when the
++attempt fails.
++
++The attacks are grouped by what they try to subvert:
++
++* the gate itself - spend without ever being approved
++* the scope - spend an approval on a different, larger action
++* the quorum - be both approvers
++* the tenant boundary - approve or spend someone else's authorization
++* the clock - use an approval after it died
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++
++import pytest
++from httpx import ASGITransport, AsyncClient
++
++from core.exceptions import ConflictError, NotFoundError
++from core.jwt import JWTManager
++from modules.authorization.service import AuthorizationService
++from policy.models import ActionKind, FinancialAction
++from repositories.authorizations import _AUTHORIZATIONS, reset_authorizations
++
++pytestmark = [pytest.mark.asyncio, pytest.mark.security]
++
++MERCHANT = "merchant_keen"
++OTHER_MERCHANT = "merchant_acme"
++TENANT = "11111111-1111-1111-1111-111111111111"
++
++QUIET = {
++    "today_total_paise": 0,
++    "actions_last_hour": 0,
++    "buyer_age_days": 900,
++    "buyer_prior_orders": 40,
++    "buyer_country": "IN",
++    "ip_country": "IN",
++}
++
++
++@pytest.fixture(autouse=True)
++def _clean():
++    reset_authorizations()
++    yield
++    reset_authorizations()
++
++
++@pytest.fixture
++def app():
++    from main import create_app
++
++    return create_app()
++
++
++@pytest.fixture
++async def client(app):
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
++        yield c
++
++
++def token(user_id: str, role: str, merchant_id: str = MERCHANT) -> dict:
++    jwt = JWTManager().create_access_token(
++        user_id=user_id, merchant_id=merchant_id, role=role, tenant_id=TENANT
++    )
++    return {"Authorization": f"Bearer {jwt}"}
++
++
++@pytest.fixture
++def mallory():
++    """Our attacker. A real manager at this merchant - the interesting case is
++    not an outsider but an insider with legitimate credentials."""
++    return token("mgr_mallory", "manager")
++
++
++@pytest.fixture
++def bob():
++    return token("mgr_bob", "manager")
++
++
++@pytest.fixture
++def admin():
++    return token("adm_root", "admin")
++
++
++def body(amount: int, *, kind: str = "payment", subject: str = "ord_target") -> dict:
++    return {"kind": kind, "amount_paise": amount, "subject_id": subject, "context": QUIET}
++
++
++async def request_auth(client, headers, amount: int, **kw):
++    return await client.post(
++        "/api/v1/authorizations", headers=headers, json=body(amount, **kw)
++    )
++
++
++def action(
++    *, amount: int, subject: str = "ord_target", kind: ActionKind = ActionKind.PAYMENT
++) -> FinancialAction:
++    return FinancialAction(
++        kind=kind,
++        merchant_id=MERCHANT,
++        amount_paise=amount,
++        subject_id=subject,
++        actor_id="mgr_mallory",
++        actor_role="manager",
++    )
++
++
++def expire(auth_id: str) -> None:
++    """Drag an authorization's expiry into the past.
++
++    Reaches into the store rather than sleeping: the TTL is fifteen minutes and
++    a test that waited for it would be a test nobody runs.
++    """
++    _AUTHORIZATIONS[auth_id]["expires_at"] = datetime.now(UTC) - timedelta(seconds=1)
++
++
++# --- attacking the gate itself ----------------------------------------------
++
++
++async def test_a_forged_authorization_id_cannot_be_spent(client):
++    with pytest.raises(NotFoundError):
++        await AuthorizationService().consume(
++            "auth_deadbeefdeadbeef", merchant_id=MERCHANT, action=action(amount=250_000)
++        )
++
++
++async def test_a_pending_authorization_cannot_be_spent(client, mallory):
++    """The core claim. Escalated money does not move because someone asked."""
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    assert record["status"] == "pending"
++
++    with pytest.raises(ConflictError) as exc:
++        await AuthorizationService().consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=15_000_000)
++        )
++    assert exc.value.code == "AUTHORIZATION_NOT_APPROVED"
++
++
++async def test_a_denied_authorization_cannot_be_spent(client, mallory):
++    record = (await request_auth(client, mallory, 999_000_000)).json()
++    with pytest.raises(ConflictError) as exc:
++        await AuthorizationService().consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=999_000_000)
++        )
++    assert exc.value.code == "AUTHORIZATION_NOT_APPROVED"
++
++
++async def test_a_revoked_authorization_cannot_be_spent(client, mallory):
++    record = (await request_auth(client, mallory, 250_000)).json()
++    service = AuthorizationService()
++    await service.revoke(record["id"], merchant_id=MERCHANT)
++
++    with pytest.raises(ConflictError):
++        await service.consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=250_000)
++        )
++
++
++async def test_an_authorization_cannot_be_spent_twice(client, mallory):
++    record = (await request_auth(client, mallory, 250_000)).json()
++    service = AuthorizationService()
++    await service.consume(record["id"], merchant_id=MERCHANT, action=action(amount=250_000))
++
++    with pytest.raises(ConflictError) as exc:
++        await service.consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=250_000)
++        )
++    assert exc.value.code == "AUTHORIZATION_ALREADY_CONSUMED"
++
++
++# --- attacking the scope ----------------------------------------------------
++
++
++async def test_an_approval_for_a_small_amount_cannot_pay_a_large_one(client, mallory):
++    """The signed blank cheque. Without fingerprint binding, every other
++    guarantee in this file is decoration: get ten rupees approved, spend ten
++    lakh."""
++    record = (await request_auth(client, mallory, 1_000)).json()
++    assert record["status"] == "approved"
++
++    with pytest.raises(ConflictError) as exc:
++        await AuthorizationService().consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=100_000_000)
++        )
++    assert exc.value.code == "AUTHORIZATION_SCOPE_MISMATCH"
++
++
++async def test_shaving_the_amount_upward_by_one_paisa_is_caught(client, mallory):
++    """No tolerance. A gate that allowed "close enough" would be probed for
++    exactly how close."""
++    record = (await request_auth(client, mallory, 250_000)).json()
++    with pytest.raises(ConflictError):
++        await AuthorizationService().consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=250_001)
++        )
++
++
++async def test_an_approval_cannot_be_moved_to_another_order(client, mallory):
++    record = (await request_auth(client, mallory, 250_000, subject="ord_target")).json()
++    with pytest.raises(ConflictError) as exc:
++        await AuthorizationService().consume(
++            record["id"],
++            merchant_id=MERCHANT,
++            action=action(amount=250_000, subject="ord_someone_elses"),
++        )
++    assert exc.value.code == "AUTHORIZATION_SCOPE_MISMATCH"
++
++
++async def test_a_payment_approval_cannot_be_spent_as_a_refund(client, mallory):
++    record = (await request_auth(client, mallory, 250_000)).json()
++    with pytest.raises(ConflictError):
++        await AuthorizationService().consume(
++            record["id"],
++            merchant_id=MERCHANT,
++            action=action(amount=250_000, kind=ActionKind.REFUND),
++        )
++
++
++async def test_a_failed_scope_check_leaves_the_authorization_unspent(client, mallory):
++    """A rejected attempt must not burn the record - otherwise a single
++    malformed retry becomes a denial of service on a legitimate payment."""
++    record = (await request_auth(client, mallory, 250_000)).json()
++    service = AuthorizationService()
++    with pytest.raises(ConflictError):
++        await service.consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=999_999)
++        )
++
++    still_good = await service.consume(
++        record["id"], merchant_id=MERCHANT, action=action(amount=250_000)
++    )
++    assert still_good["status"] == "consumed"
++
++
++# --- attacking the quorum ---------------------------------------------------
++
++
++async def test_the_requester_cannot_approve_their_own_request(client, mallory):
++    """Four eyes. Without this a quorum of two is one person wearing two hats."""
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=mallory, json={}
++    )
++    assert r.status_code == 403
++    assert r.json()["error"]["code"] == "SELF_APPROVAL_FORBIDDEN"
++
++
++async def test_self_approval_is_refused_even_for_an_admin(client, admin):
++    """Admin is a role, not an exemption from separation of duties."""
++    record = (await request_auth(client, admin, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=admin, json={}
++    )
++    assert r.status_code == 403
++
++
++async def test_one_approver_cannot_fill_a_quorum_alone(client, mallory, bob):
++    """Clicking approve twice must not satisfy a two-person requirement."""
++    record = (await request_auth(client, mallory, 35_000_000)).json()
++    assert record["required_approvals"] == 2
++
++    first = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=bob, json={}
++    )
++    assert first.status_code == 200
++    assert first.json()["status"] == "pending"
++
++    second = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=bob, json={}
++    )
++    assert second.status_code == 409
++    assert second.json()["error"]["code"] == "DUPLICATE_APPROVAL"
++
++    after = await client.get(f"/api/v1/authorizations/{record['id']}", headers=bob)
++    assert after.json()["status"] == "pending"
++    assert len(after.json()["approvers"]) == 1
++
++
++async def test_a_role_without_the_permission_cannot_approve(client, mallory):
++    for role in ("shopper", "support_agent", "service"):
++        record = (await request_auth(client, mallory, 15_000_000)).json()
++        r = await client.post(
++            f"/api/v1/authorizations/{record['id']}/approve",
++            headers=token(f"user_{role}", role),
++            json={},
++        )
++        assert r.status_code == 403, f"{role} was allowed to approve"
++
++
++async def test_a_service_account_cannot_approve_its_own_requests(client):
++    """A leaked service key that could approve what it asked for would make the
++    whole gate ceremonial."""
++    svc = token("svc_worker", "service")
++    record = (await request_auth(client, svc, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=svc, json={}
++    )
++    assert r.status_code == 403
++
++
++async def test_an_approver_cannot_be_named_in_the_body(client, mallory, bob):
++    """No field names the approver; it is always the token holder. Otherwise
++    four-eyes is advisory."""
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve",
++        headers=bob,
++        json={"approver_id": "mgr_alice"},
++    )
++    assert r.status_code == 422
++
++
++# --- attacking the tenant boundary ------------------------------------------
++
++
++async def test_another_merchant_cannot_read_the_authorization(client, mallory):
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    outsider = token("mgr_eve", "manager", merchant_id=OTHER_MERCHANT)
++    r = await client.get(f"/api/v1/authorizations/{record['id']}", headers=outsider)
++    assert r.status_code == 404, "existence must not be confirmed across tenants"
++
++
++async def test_another_merchants_admin_cannot_approve(client, mallory):
++    """Admin is scoped to a merchant, not to the deployment."""
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    outsider = token("adm_eve", "admin", merchant_id=OTHER_MERCHANT)
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=outsider, json={}
++    )
++    assert r.status_code == 404
++
++
++async def test_another_merchant_cannot_spend_the_authorization(client, mallory):
++    record = (await request_auth(client, mallory, 250_000)).json()
++    with pytest.raises(NotFoundError):
++        await AuthorizationService().consume(
++            record["id"], merchant_id=OTHER_MERCHANT, action=action(amount=250_000)
++        )
++
++
++async def test_a_forbidden_and_a_missing_authorization_answer_identically(client, mallory):
++    """Any difference is an oracle for enumerating real ids.
++
++    The message echoes the id that was asked for, which is the caller's own
++    input and so tells them nothing. Normalising it away is what leaves the
++    part that would leak: everything else must match byte for byte.
++    """
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    real_id = record["id"]
++    fake_id = "auth_0000000000000000"
++    outsider = token("mgr_eve", "manager", merchant_id=OTHER_MERCHANT)
++
++    def comparable(response, asked_for: str):
++        error = dict(response.json()["error"])
++        error.pop("request_id", None)
++        error["message"] = error["message"].replace(asked_for, "<id>")
++        return response.status_code, error
++
++    real = await client.get(f"/api/v1/authorizations/{real_id}", headers=outsider)
++    fake = await client.get(f"/api/v1/authorizations/{fake_id}", headers=outsider)
++
++    assert comparable(real, real_id) == comparable(fake, fake_id)
++    # And the 404 is genuinely an authorization decision, not a lookup miss:
++    # the owner sees the same record perfectly well.
++    assert (
++        await client.get(f"/api/v1/authorizations/{real_id}", headers=mallory)
++    ).status_code == 200
++
++
++# --- attacking the clock ----------------------------------------------------
++
++
++async def test_an_expired_authorization_cannot_be_approved(client, mallory, bob):
++    """A stale approval is an approval granted against facts that no longer
++    hold."""
++    record = (await request_auth(client, mallory, 15_000_000)).json()
++    expire(record["id"])
++
++    r = await client.post(
++        f"/api/v1/authorizations/{record['id']}/approve", headers=bob, json={}
++    )
++    assert r.status_code == 409
++    assert r.json()["error"]["code"] == "AUTHORIZATION_EXPIRED"
++
++
++async def test_an_expired_authorization_cannot_be_spent(client, mallory):
++    record = (await request_auth(client, mallory, 250_000)).json()
++    assert record["status"] == "approved"
++    expire(record["id"])
++
++    with pytest.raises(ConflictError) as exc:
++        await AuthorizationService().consume(
++            record["id"], merchant_id=MERCHANT, action=action(amount=250_000)
++        )
++    assert exc.value.code == "AUTHORIZATION_EXPIRED"
++
++
++async def test_expiry_is_applied_on_read_not_by_a_sweeper(client, mallory):
++    """A background job that fell behind would leave records that read as
++    approved past their deadline."""
++    record = (await request_auth(client, mallory, 250_000)).json()
++    expire(record["id"])
++    r = await client.get(f"/api/v1/authorizations/{record['id']}", headers=mallory)
++    assert r.json()["status"] == "expired"
++
++
++# --- attacking the policy layer ---------------------------------------------
++
++
++async def test_a_role_cannot_be_claimed_in_the_body(client):
++    """The actor's role comes from the token. A shopper naming itself admin in
++    the body must not become one."""
++    shopper = token("shopper_dave", "shopper")
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers=shopper,
++        json={
++            "kind": "payment",
++            "amount_paise": 1_000,
++            "subject_id": "ord_x",
++            "actor_role": "admin",
++        },
++    )
++    assert r.status_code in (403, 422)
++
++
++async def test_a_manager_cannot_authorize_a_payout(client, mallory):
++    """Payouts move money to a bank account. Admin only, enforced in the rules
++    and not merely by which button a UI shows."""
++    r = await client.post(
++        "/api/v1/authorizations", headers=mallory, json=body(1_000, kind="payout")
++    )
++    assert r.json()["status"] == "denied"
++
++
++async def test_splitting_an_amount_does_not_evade_the_daily_cap(client, mallory):
++    """The cap counts the action being requested, so the last one over the line
++    is refused rather than being the one that slips through."""
++    from config.policy import load_merchant_policy
++
++    policy = load_merchant_policy(MERCHANT)
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers=mallory,
++        json={
++            "kind": "payment",
++            "amount_paise": 1_000,
++            "subject_id": "ord_x",
++            "context": {**QUIET, "today_total_paise": policy.daily_total_cap_paise},
++        },
++    )
++    assert r.json()["status"] == "denied"
++
++
++async def test_a_tampered_token_is_refused_before_any_gate_runs(client):
++    good = JWTManager().create_access_token(
++        user_id="mgr_mallory", merchant_id=MERCHANT, role="manager", tenant_id=TENANT
++    )
++    forged = good[:-4] + ("aaaa" if not good.endswith("aaaa") else "bbbb")
++    r = await client.post(
++        "/api/v1/authorizations",
++        headers={"Authorization": f"Bearer {forged}"},
++        json=body(250_000),
++    )
++    assert r.status_code == 401
++
++
++async def test_an_unauthenticated_caller_reaches_nothing(client):
++    assert (await client.post("/api/v1/authorizations", json=body(1))).status_code == 401
++    assert (await client.get("/api/v1/authorizations/auth_x")).status_code == 401
++    assert (
++        await client.post("/api/v1/authorizations/auth_x/approve", json={})
++    ).status_code == 401
+diff --git a/api/tests/unit/test_policy_actions.py b/api/tests/unit/test_policy_actions.py
+new file mode 100644
+index 0000000..187ea11
+--- /dev/null
++++ b/api/tests/unit/test_policy_actions.py
+@@ -0,0 +1,318 @@
++"""The deterministic policy gate for financial actions.
++
++Pure-function tests, so they can be exhaustive and adversarial rather than
++representative. This is the layer where "may this money move?" is answered, and
++the cases below are chosen for the ways that answer can be wrong: a limit that
++can be approved past, a cap that can be exceeded by exactly one action, a
++refund that is checked against the wrong number.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from config.policy import MerchantPolicy
++from policy.engine import PolicyEngine
++from policy.models import ActionKind, FinancialAction, PolicyOutcome
++from policy.rules.action_rules import (
++    rule_actor_permitted,
++    rule_amount_ceiling,
++    rule_daily_cap,
++    rule_geography,
++    rule_refund_within_capture,
++    rule_velocity,
++)
++
++POLICY = MerchantPolicy()
++ENGINE = PolicyEngine()
++
++
++def action(**overrides) -> FinancialAction:
++    """An unremarkable payment, unless a test says otherwise."""
++    base = {
++        "kind": ActionKind.PAYMENT,
++        "merchant_id": "merchant_keen",
++        "amount_paise": 250_000,
++        "subject_id": "ord_abc123",
++        "actor_id": "user_shopper",
++        "actor_role": "shopper",
++    }
++    return FinancialAction(**{**base, **overrides})
++
++
++def outcome(**overrides) -> PolicyOutcome:
++    return ENGINE.evaluate_action(action(**overrides), policy=POLICY).outcome
++
++
++# --- the happy path ---------------------------------------------------------
++
++
++def test_an_ordinary_payment_is_allowed():
++    assert outcome() is PolicyOutcome.ALLOW
++
++
++def test_every_rule_reports_even_when_it_passes():
++    """A decision recording only failures cannot prove the cap was checked."""
++    decision = ENGINE.evaluate_action(action(), policy=POLICY)
++    assert len(decision.rule_results) == decision.metadata["rules_evaluated"]
++    assert all(r.passed for r in decision.rule_results)
++    assert decision.reasons == []
++
++
++def test_the_decision_is_deterministic():
++    """Same action twice, same verdict - the property auditing depends on."""
++    a = action(amount_paise=15_000_000)
++    first = ENGINE.evaluate_action(a, policy=POLICY)
++    second = ENGINE.evaluate_action(a, policy=POLICY)
++
++    assert first.outcome is second.outcome
++    assert first.action_fingerprint == second.action_fingerprint
++    assert [r.rule_id for r in first.rule_results] == [r.rule_id for r in second.rule_results]
++    assert [r.outcome for r in first.rule_results] == [r.outcome for r in second.rule_results]
++    # Only the decision id differs; it identifies the evaluation, not the verdict.
++    assert first.decision_id != second.decision_id
++
++
++# --- amount limits ----------------------------------------------------------
++
++
++def test_amount_above_the_review_threshold_escalates():
++    assert outcome(amount_paise=POLICY.escalate_payment_above_paise + 1) is PolicyOutcome.ESCALATE
++
++
++def test_amount_exactly_at_the_threshold_does_not_escalate():
++    """Thresholds are exclusive. Off-by-one here is a rule nobody can predict."""
++    assert outcome(amount_paise=POLICY.escalate_payment_above_paise) is PolicyOutcome.ALLOW
++
++
++def test_amount_above_the_ceiling_is_denied_not_escalated():
++    """A ceiling a human could approve past is a suggestion, not a ceiling."""
++    assert outcome(amount_paise=POLICY.max_payment_paise + 1) is PolicyOutcome.DENY
++
++
++def test_zero_amount_is_denied():
++    assert outcome(amount_paise=0) is PolicyOutcome.DENY
++
++
++def test_a_float_amount_never_reaches_the_rules():
++    """StrictInt refuses at construction; truncation would change the amount."""
++    with pytest.raises(ValueError):
++        action(amount_paise=249.9)
++
++
++def test_a_negative_amount_never_reaches_the_rules():
++    with pytest.raises(ValueError):
++        action(amount_paise=-1)
++
++
++def test_each_kind_has_its_own_ceiling():
++    payout = action(kind=ActionKind.PAYOUT, actor_role="admin", amount_paise=60_000_000)
++    payment = action(amount_paise=60_000_000)
++    # 6 lakh rupees: over the payment ceiling, under the payout ceiling.
++    assert rule_amount_ceiling(payout, POLICY).passed
++    assert not rule_amount_ceiling(payment, POLICY).passed
++
++
++# --- who may ask ------------------------------------------------------------
++
++
++def test_a_shopper_may_pay():
++    assert rule_actor_permitted(action(actor_role="shopper"), POLICY).passed
++
++
++def test_a_shopper_may_not_refund_themselves():
++    """The obvious attack, and the reason the actor matrix exists."""
++    refund = action(kind=ActionKind.REFUND, actor_role="shopper", captured_paise=999_999)
++    assert rule_actor_permitted(refund, POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_support_may_not_initiate_any_money_movement():
++    for kind in ActionKind:
++        assert not rule_actor_permitted(
++            action(kind=kind, actor_role="support_agent"), POLICY
++        ).passed
++
++
++def test_only_an_admin_may_pay_out():
++    for role in ("shopper", "support_agent", "manager", "service"):
++        payout = action(kind=ActionKind.PAYOUT, actor_role=role)
++        assert not rule_actor_permitted(payout, POLICY).passed
++    assert rule_actor_permitted(action(kind=ActionKind.PAYOUT, actor_role="admin"), POLICY).passed
++
++
++def test_an_unknown_role_matches_nothing_and_is_denied():
++    """An allow-list fails closed; a deny-list would have let this through."""
++    assert outcome(actor_role="wizard") is PolicyOutcome.DENY
++
++
++# --- daily cap --------------------------------------------------------------
++
++
++def test_the_daily_cap_counts_this_action_too():
++    """Checking the running total alone lets the cap be exceeded by one action -
++    and the last action is the one an attacker gets to choose."""
++    at_the_line = action(
++        today_total_paise=POLICY.daily_total_cap_paise - 100, amount_paise=100
++    )
++    over = action(today_total_paise=POLICY.daily_total_cap_paise - 100, amount_paise=101)
++    assert rule_daily_cap(at_the_line, POLICY).passed
++    assert rule_daily_cap(over, POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_daily_cap_denial_reports_the_projected_total():
++    result = rule_daily_cap(
++        action(today_total_paise=POLICY.daily_total_cap_paise, amount_paise=1), POLICY
++    )
++    assert result.details["projected_paise"] == POLICY.daily_total_cap_paise + 1
++
++
++# --- velocity ---------------------------------------------------------------
++
++
++def test_moderate_velocity_escalates_rather_than_refusing():
++    """A busy hour is usually a sale. Escalating lets it through with a human."""
++    busy = action(actions_last_hour=POLICY.escalate_actions_per_hour_above)
++    assert rule_velocity(busy, POLICY).outcome is PolicyOutcome.ESCALATE
++
++
++def test_extreme_velocity_is_denied():
++    runaway = action(actions_last_hour=POLICY.max_actions_per_hour)
++    assert rule_velocity(runaway, POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_quiet_hour_passes_velocity():
++    assert rule_velocity(action(actions_last_hour=3), POLICY).passed
++
++
++# --- refunds ----------------------------------------------------------------
++
++
++def refund(**overrides) -> FinancialAction:
++    base = {
++        "kind": ActionKind.REFUND,
++        "actor_role": "manager",
++        "captured_paise": 100_000,
++        "already_refunded_paise": 0,
++        "amount_paise": 50_000,
++    }
++    return action(**{**base, **overrides})
++
++
++def test_a_partial_refund_within_the_capture_is_fine():
++    assert rule_refund_within_capture(refund(), POLICY).passed
++
++
++def test_a_refund_larger_than_the_capture_is_denied():
++    assert (
++        rule_refund_within_capture(refund(amount_paise=100_001), POLICY).outcome
++        is PolicyOutcome.DENY
++    )
++
++
++def test_earlier_refunds_are_deducted():
++    """Without the subtraction the same money leaves twice."""
++    second = refund(amount_paise=60_000, already_refunded_paise=50_000)
++    assert rule_refund_within_capture(second, POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_a_fully_refunded_payment_has_nothing_left():
++    exhausted = refund(amount_paise=1, already_refunded_paise=100_000)
++    assert rule_refund_within_capture(exhausted, POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_the_capture_rule_ignores_non_refunds():
++    assert rule_refund_within_capture(action(), POLICY).passed
++
++
++def test_refunds_escalate_sooner_than_payments():
++    """Money leaving is harder to claw back, so it earns scrutiny earlier."""
++    assert POLICY.escalate_refund_above_paise < POLICY.escalate_payment_above_paise
++    amount = POLICY.escalate_refund_above_paise + 1
++    assert (
++        ENGINE.evaluate_action(
++            refund(amount_paise=amount, captured_paise=amount), policy=POLICY
++        ).outcome
++        is PolicyOutcome.ESCALATE
++    )
++
++
++# --- geography --------------------------------------------------------------
++
++
++def test_a_blocked_country_is_denied():
++    policy = MerchantPolicy(blocked_countries=["KP"])
++    assert rule_geography(action(buyer_country="KP"), policy).outcome is PolicyOutcome.DENY
++
++
++def test_a_country_outside_the_usual_markets_escalates():
++    assert rule_geography(action(buyer_country="US"), POLICY).outcome is PolicyOutcome.ESCALATE
++
++
++def test_an_empty_allow_list_means_no_restriction():
++    """Failing closed here would stop every transaction the day a field is cleared."""
++    policy = MerchantPolicy(allowed_countries=[])
++    assert rule_geography(action(buyer_country="BR"), policy).passed
++
++
++def test_country_matching_is_case_insensitive():
++    assert rule_geography(action(buyer_country="in"), POLICY).passed
++
++
++# --- aggregation ------------------------------------------------------------
++
++
++def test_deny_beats_escalate():
++    """An allow anywhere must never soften a denial - that would be a bypass
++    built into the gate's own arithmetic."""
++    both = action(
++        amount_paise=POLICY.max_payment_paise + 1,  # denies
++        actions_last_hour=POLICY.escalate_actions_per_hour_above,  # escalates
++    )
++    assert ENGINE.evaluate_action(both, policy=POLICY).outcome is PolicyOutcome.DENY
++
++
++def test_escalate_beats_allow():
++    assert outcome(buyer_country="US") is PolicyOutcome.ESCALATE
++
++
++def test_every_failure_is_reported_not_just_the_first():
++    decision = ENGINE.evaluate_action(
++        action(amount_paise=POLICY.max_payment_paise + 1, actor_role="wizard"), policy=POLICY
++    )
++    assert len(decision.reasons) >= 2
++
++
++# --- fingerprints -----------------------------------------------------------
++
++
++def test_the_fingerprint_covers_the_amount():
++    """Otherwise an approval for a small amount is spendable on a large one."""
++    assert action(amount_paise=100).fingerprint() != action(amount_paise=101).fingerprint()
++
++
++def test_the_fingerprint_covers_the_subject():
++    assert action(subject_id="ord_a").fingerprint() != action(subject_id="ord_b").fingerprint()
++
++
++def test_the_fingerprint_covers_the_kind():
++    payment = action()
++    refund_same_amount = action(kind=ActionKind.REFUND, actor_role="manager")
++    assert payment.fingerprint() != refund_same_amount.fingerprint()
++
++
++def test_the_fingerprint_covers_the_merchant():
++    assert action(merchant_id="a").fingerprint() != action(merchant_id="b").fingerprint()
++
++
++def test_the_fingerprint_ignores_volatile_context():
++    """Velocity counters move between requesting an approval and spending it.
++    An approval invalidated by a counter ticking would be useless."""
++    quiet = action(actions_last_hour=0, today_total_paise=0)
++    busy = action(actions_last_hour=19, today_total_paise=999_999)
++    assert quiet.fingerprint() == busy.fingerprint()
++
++
++def test_the_action_model_refuses_unknown_fields():
++    """extra='forbid' - a typo'd field must fail, not be silently ignored."""
++    with pytest.raises(ValueError):
++        action(amount_pasie=100)
+diff --git a/api/tests/unit/test_refund_guard.py b/api/tests/unit/test_refund_guard.py
+new file mode 100644
+index 0000000..4b8255e
+--- /dev/null
++++ b/api/tests/unit/test_refund_guard.py
+@@ -0,0 +1,268 @@
++"""Refund eligibility.
++
++Every case here is a subtraction someone has got wrong in production: refunding
++more than was captured, forgetting to deduct earlier refunds, refunding an
++order that was never paid, refunding after the acquirer's window closed so the
++money leaves the merchant without reaching the cardholder.
++
++A refund fails quietly in a way a payment does not. A declined card is
++immediate and visible; an over-refund succeeds, the customer is pleased, and it
++surfaces a month later during reconciliation.
++"""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++
++import pytest
++
++from config.policy import MerchantPolicy
++from core.exceptions import ValidationError
++from modules.refunds.guard import REFUNDABLE_STATUSES, RefundGuard, refundable_paise
++
++POLICY = MerchantPolicy()
++GUARD = RefundGuard(policy=POLICY)
++NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
++
++
++def order(**overrides) -> dict:
++    base = {
++        "id": "ord_abc123",
++        "merchant_id": "merchant_keen",
++        "status": "paid",
++        "final_amount_paise": 100_000,
++        "refunded_paise": 0,
++        "paid_at": NOW - timedelta(days=3),
++    }
++    return {**base, **overrides}
++
++
++def verdict(*, amount=50_000, ord_overrides=None, now=NOW, merchant="merchant_keen"):
++    return GUARD.evaluate(
++        order=order(**(ord_overrides or {})),
++        merchant_id=merchant,
++        amount_paise=amount,
++        now=now,
++    )
++
++
++# --- the happy path ---------------------------------------------------------
++
++
++def test_a_partial_refund_on_a_recent_paid_order_is_eligible():
++    result = verdict()
++    assert result.eligible, result.reasons
++    assert result.reasons == []
++    assert result.max_refundable_paise == 100_000
++
++
++def test_a_full_refund_is_eligible():
++    assert verdict(amount=100_000).eligible
++
++
++def test_the_verdict_carries_the_numbers_it_reasoned_from():
++    details = verdict().details
++    assert details["captured_paise"] == 100_000
++    assert details["already_refunded_paise"] == 0
++    assert details["refund_window_days"] == POLICY.refund_window_days
++
++
++# --- arithmetic -------------------------------------------------------------
++
++
++def test_refunding_more_than_was_captured_is_refused():
++    result = verdict(amount=100_001)
++    assert not result.eligible
++    assert any("still refundable" in r for r in result.reasons)
++
++
++def test_earlier_refunds_are_deducted():
++    """Without the subtraction the same money leaves twice."""
++    result = verdict(amount=60_000, ord_overrides={"refunded_paise": 50_000})
++    assert not result.eligible
++    assert result.max_refundable_paise == 50_000
++
++
++def test_a_second_partial_refund_within_the_remainder_is_fine():
++    assert verdict(amount=50_000, ord_overrides={"refunded_paise": 50_000}).eligible
++
++
++def test_a_fully_refunded_order_has_nothing_left():
++    result = verdict(amount=1, ord_overrides={"refunded_paise": 100_000})
++    assert not result.eligible
++    assert result.max_refundable_paise == 0
++    assert any("fully refunded" in r for r in result.reasons)
++
++
++def test_refundable_is_floored_at_zero():
++    """A negative remainder would compare as less than any request and report
++    the wrong failure, hiding the real problem: the books already disagree."""
++    assert refundable_paise({"final_amount_paise": 100, "refunded_paise": 500}) == 0
++
++
++def test_a_zero_refund_is_refused():
++    assert not verdict(amount=0).eligible
++
++
++def test_a_negative_refund_is_refused():
++    """Otherwise a "refund" of minus ten thousand is a charge nobody approved."""
++    assert not verdict(amount=-10_000).eligible
++
++
++def test_a_float_amount_is_rejected_outright():
++    """Not merely refused - raised. A float here silently refunds 249 paise
++    instead of 249.9, and unlike a mispriced sale nobody complains."""
++    with pytest.raises(ValidationError):
++        verdict(amount=499.5)
++
++
++def test_a_boolean_amount_is_rejected():
++    """bool subclasses int; True would otherwise refund one paisa."""
++    with pytest.raises(ValidationError):
++        verdict(amount=True)
++
++
++# --- order state ------------------------------------------------------------
++
++
++def test_an_unpaid_order_cannot_be_refunded():
++    result = verdict(ord_overrides={"status": "pending", "paid_at": None})
++    assert not result.eligible
++    assert any("not refundable" in r for r in result.reasons)
++
++
++@pytest.mark.parametrize("status", ["pending", "failed", "cancelled", "expired", ""])
++def test_only_captured_money_comes_back(status):
++    assert not verdict(ord_overrides={"status": status}).eligible
++
++
++@pytest.mark.parametrize("status", sorted(REFUNDABLE_STATUSES))
++def test_every_refundable_status_is_accepted(status):
++    assert verdict(ord_overrides={"status": status}).eligible
++
++
++def test_an_unknown_status_is_refused_by_default():
++    """An allow-list. A status nobody anticipated must not be refundable."""
++    assert not verdict(ord_overrides={"status": "settled_maybe"}).eligible
++
++
++def test_a_missing_order_is_not_eligible():
++    result = GUARD.evaluate(order=None, merchant_id="merchant_keen", amount_paise=100)
++    assert not result.eligible
++    assert result.reasons == ["order not found"]
++
++
++def test_another_merchants_order_is_reported_as_missing():
++    """Same answer as a missing order, and no detail about the real owner:
++    confirming an id belongs to *someone* maps another merchant's orders."""
++    result = verdict(merchant="merchant_acme")
++    assert not result.eligible
++    assert result.reasons == ["order not found"]
++
++
++# --- the refund window ------------------------------------------------------
++
++
++def test_a_refund_inside_the_window_is_eligible():
++    old = NOW - timedelta(days=POLICY.refund_window_days - 1)
++    assert verdict(ord_overrides={"paid_at": old}).eligible
++
++
++def test_a_refund_after_the_window_is_refused():
++    stale = NOW - timedelta(days=POLICY.refund_window_days + 1)
++    result = verdict(ord_overrides={"paid_at": stale})
++    assert not result.eligible
++    assert any("refund window" in r for r in result.reasons)
++
++
++def test_the_window_boundary_is_inclusive():
++    exactly = NOW - timedelta(days=POLICY.refund_window_days)
++    assert verdict(ord_overrides={"paid_at": exactly}).eligible
++
++
++def test_a_paid_order_with_no_capture_timestamp_fails_closed():
++    """An order that cannot be aged cannot be shown to be inside the window."""
++    result = verdict(ord_overrides={"paid_at": None})
++    assert not result.eligible
++    assert any("capture timestamp" in r for r in result.reasons)
++
++
++def test_a_naive_timestamp_is_read_as_utc():
++    naive = (NOW - timedelta(days=2)).replace(tzinfo=None)
++    assert verdict(ord_overrides={"paid_at": naive}).eligible
++
++
++def test_the_verdict_is_reproducible_for_a_past_moment():
++    """"Was this eligible at the time?" gets asked during chargeback disputes,
++    long after the clock has moved on."""
++    stale = NOW - timedelta(days=POLICY.refund_window_days + 10)
++    then = GUARD.evaluate(
++        order=order(paid_at=stale),
++        merchant_id="merchant_keen",
++        amount_paise=1_000,
++        now=stale + timedelta(days=1),
++    )
++    now = verdict(amount=1_000, ord_overrides={"paid_at": stale})
++    assert then.eligible
++    assert not now.eligible
++
++
++# --- reporting --------------------------------------------------------------
++
++
++def test_every_reason_is_collected_not_just_the_first():
++    """A refund refused for four reasons that reports one sends an operator
++    round the loop four times."""
++    result = verdict(
++        amount=999_999,
++        ord_overrides={"status": "cancelled", "paid_at": NOW - timedelta(days=400)},
++    )
++    assert len(result.reasons) >= 3
++
++
++def test_a_large_refund_is_flagged_as_needing_authorization():
++    big = POLICY.escalate_refund_above_paise + 1
++    result = verdict(
++        amount=big, ord_overrides={"final_amount_paise": big + 1_000}
++    )
++    assert result.eligible
++    assert result.requires_authorization
++
++
++def test_a_small_refund_is_not_flagged():
++    assert not verdict(amount=1_000).requires_authorization
++
++
++def test_an_ineligible_refund_is_never_flagged_as_authorizable():
++    """Otherwise a caller could read requires_authorization as a green light."""
++    assert not verdict(amount=999_999).requires_authorization
++
++
++def test_a_verdict_serialises_for_the_wire():
++    payload = verdict().to_dict()
++    assert set(payload) == {
++        "eligible",
++        "max_refundable_paise",
++        "reasons",
++        "requires_authorization",
++        "details",
++    }
++
++
++# --- handing off to the gate ------------------------------------------------
++
++
++def test_the_action_reads_its_money_from_the_order_not_the_caller():
++    """A caller able to name what was captured could name a larger number and
++    refund against it."""
++    action = RefundGuard.to_action(
++        order=order(final_amount_paise=100_000, refunded_paise=25_000),
++        merchant_id="merchant_keen",
++        amount_paise=10_000,
++        actor_id="mgr_1",
++        actor_role="manager",
++    )
++    assert action.captured_paise == 100_000
++    assert action.already_refunded_paise == 25_000
++    assert action.subject_id == "ord_abc123"
++    assert action.kind.value == "refund"
+diff --git a/api/tests/unit/test_risk_service.py b/api/tests/unit/test_risk_service.py
+new file mode 100644
+index 0000000..8ae3794
+--- /dev/null
++++ b/api/tests/unit/test_risk_service.py
+@@ -0,0 +1,287 @@
++"""Risk scoring: the four signals and how they combine.
++
++The aggregation is the part worth testing hardest. A weighted average would
++pass most of the tests below and fail the one that matters - a single severe
++signal must not be diluted into "low" by three quiet ones, because a confirmed
++fraud indicator is not made safe by the transaction being unremarkable in every
++other respect.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from config.policy import MerchantPolicy
++from modules.risk.service import LOW_MAX, MEDIUM_MAX, RiskBand, RiskService
++from policy.models import ActionKind, FinancialAction
++
++POLICY = MerchantPolicy()
++RISK = RiskService()
++
++
++def action(**overrides) -> FinancialAction:
++    base = {
++        "kind": ActionKind.PAYMENT,
++        "merchant_id": "merchant_keen",
++        "amount_paise": 250_000,
++        "subject_id": "ord_abc123",
++        "actor_id": "user_shopper",
++        "actor_role": "shopper",
++    }
++    return FinancialAction(**{**base, **overrides})
++
++
++def band(**overrides) -> RiskBand:
++    return RISK.assess(action(**overrides), policy=POLICY).band
++
++
++def score(**overrides) -> float:
++    return RISK.assess(action(**overrides), policy=POLICY).score
++
++
++# --- the quiet case ---------------------------------------------------------
++
++
++def test_an_ordinary_payment_scores_zero():
++    """An established buyer paying a normal amount from the usual country must
++    score nothing at all. A scorer that returns "a little bit" for every
++    transaction adds a constant to every score and moves the band edges without
++    anyone deciding to."""
++    assert score() == 0.0
++    assert band() is RiskBand.LOW
++
++
++def test_scoring_is_deterministic():
++    a = action(amount_paise=15_000_000, buyer_age_days=2)
++    assert RISK.assess(a, policy=POLICY).score == RISK.assess(a, policy=POLICY).score
++
++
++def test_an_assessment_is_immutable():
++    """It is evidence about a moment, not a working value."""
++    assessment = RISK.assess(action(), policy=POLICY)
++    with pytest.raises((AttributeError, TypeError)):
++        assessment.score = 0.99
++
++
++# --- amount -----------------------------------------------------------------
++
++
++def test_a_small_amount_contributes_nothing():
++    assert RISK.assess(action(amount_paise=1_000), policy=POLICY).components["amount"] == 0.0
++
++
++def test_the_score_rises_with_the_amount():
++    ladder = [
++        score(amount_paise=1_000),
++        score(amount_paise=9_000_000),
++        score(amount_paise=15_000_000),
++        score(amount_paise=35_000_000),
++    ]
++    assert ladder == sorted(ladder), ladder
++    assert len(set(ladder)) > 1, "the amount signal is not moving the score"
++
++
++def test_just_over_the_threshold_is_medium_not_high():
++    """A cliff where one rupee more demands a second approver teaches people to
++    split payments to stay under it."""
++    assert band(amount_paise=POLICY.escalate_payment_above_paise + 1) is RiskBand.MEDIUM
++
++
++def test_far_over_the_threshold_is_high():
++    assert band(amount_paise=POLICY.escalate_payment_above_paise * 3) is RiskBand.HIGH
++
++
++def test_each_kind_is_scored_against_its_own_reference():
++    """A payout that empties an account must not read as ordinary just because
++    a payment of the same size would be."""
++    amount = 30_000_000
++    payment = RISK.assess(action(amount_paise=amount), policy=POLICY)
++    payout = RISK.assess(
++        action(kind=ActionKind.PAYOUT, actor_role="admin", amount_paise=amount), policy=POLICY
++    )
++    assert payment.components["amount"] != payout.components["amount"]
++
++
++# --- geography --------------------------------------------------------------
++
++
++def test_matching_countries_score_nothing():
++    assert RISK.assess(action(buyer_country="IN", ip_country="IN"), policy=POLICY).components[
++        "geography"
++    ] == 0.0
++
++
++def test_a_country_mismatch_is_a_signal():
++    """Often a traveller or a VPN, occasionally a stolen card used from
++    somewhere the buyer would rather not name. Worth one pair of eyes."""
++    assert band(ip_country="RU") is RiskBand.MEDIUM
++
++
++def test_a_blocked_country_maxes_the_signal():
++    policy = MerchantPolicy(blocked_countries=["KP"])
++    assessment = RISK.assess(action(buyer_country="KP", ip_country="KP"), policy=policy)
++    assert assessment.components["geography"] == 1.0
++    assert assessment.band is RiskBand.HIGH
++
++
++def test_a_blocked_ip_counts_even_when_the_buyer_claims_otherwise():
++    policy = MerchantPolicy(blocked_countries=["KP"])
++    assert RISK.assess(action(ip_country="KP"), policy=policy).band is RiskBand.HIGH
++
++
++def test_geography_is_case_insensitive():
++    assert RISK.assess(action(buyer_country="in", ip_country="IN"), policy=POLICY).components[
++        "geography"
++    ] == 0.0
++
++
++# --- new buyer --------------------------------------------------------------
++
++
++def test_a_brand_new_account_is_a_signal():
++    assert RISK.assess(
++        action(buyer_age_days=0, buyer_prior_orders=0), policy=POLICY
++    ).components["new_buyer"] == pytest.approx(0.8)
++
++
++def test_a_new_buyer_alone_never_reaches_high():
++    """Fraud has no history and neither does a first-time customer; the two are
++    indistinguishable here. A system that refused every first purchase would
++    have no second ones."""
++    assert band(buyer_age_days=0, buyer_prior_orders=0) is RiskBand.MEDIUM
++
++
++def test_an_established_buyer_scores_nothing():
++    assert (
++        RISK.assess(action(buyer_age_days=900, buyer_prior_orders=40), policy=POLICY).components[
++            "new_buyer"
++        ]
++        == 0.0
++    )
++
++
++def test_a_young_account_with_history_scores_lower_than_one_without():
++    with_history = RISK.assess(
++        action(buyer_age_days=3, buyer_prior_orders=5), policy=POLICY
++    ).components["new_buyer"]
++    without = RISK.assess(
++        action(buyer_age_days=3, buyer_prior_orders=0), policy=POLICY
++    ).components["new_buyer"]
++    assert with_history < without
++
++
++# --- velocity ---------------------------------------------------------------
++
++
++def test_a_quiet_hour_scores_nothing():
++    assert RISK.assess(action(actions_last_hour=2), policy=POLICY).components["velocity"] == 0.0
++
++
++def test_velocity_rises_with_the_count():
++    ladder = [
++        score(actions_last_hour=1),
++        score(actions_last_hour=12),
++        score(actions_last_hour=25),
++        score(actions_last_hour=90),
++    ]
++    assert ladder == sorted(ladder), ladder
++
++
++def test_sustained_velocity_reaches_high():
++    assert band(actions_last_hour=POLICY.escalate_actions_per_hour_above + 5) is RiskBand.HIGH
++
++
++def test_velocity_uses_the_same_thresholds_as_policy():
++    """Risk and policy must not drift into disagreeing about what "fast" means."""
++    just_under = RISK.assess(
++        action(actions_last_hour=POLICY.escalate_actions_per_hour_above - 1), policy=POLICY
++    ).components["velocity"]
++    at_it = RISK.assess(
++        action(actions_last_hour=POLICY.escalate_actions_per_hour_above), policy=POLICY
++    ).components["velocity"]
++    assert at_it > just_under
++
++
++# --- aggregation ------------------------------------------------------------
++
++
++def test_one_severe_signal_is_not_diluted_by_three_quiet_ones():
++    """The reason this is not a weighted average.
++
++    A maxed-out geography flag averaged with three zeroes scores 0.25 and reads
++    as "low" - precisely backwards.
++    """
++    policy = MerchantPolicy(blocked_countries=["KP"])
++    assessment = RISK.assess(
++        action(
++            amount_paise=1_000,  # quiet
++            buyer_age_days=900,  # quiet
++            buyer_prior_orders=50,  # quiet
++            buyer_country="KP",  # severe
++            ip_country="KP",
++        ),
++        policy=policy,
++    )
++    assert assessment.band is RiskBand.HIGH
++
++
++def test_corroborating_signals_escalate_the_score():
++    alone = score(amount_paise=15_000_000)
++    corroborated = score(amount_paise=15_000_000, buyer_age_days=0, buyer_prior_orders=0)
++    assert corroborated > alone
++    assert RISK.band_for(corroborated) is RiskBand.HIGH
++
++
++def test_weak_signals_cannot_accumulate_into_certainty():
++    """Saturating aggregation: extra signals always raise the score but can
++    never reach 1.0 on their own. Otherwise enough weak evidence eventually
++    convicts everybody."""
++    assert score(buyer_age_days=20, buyer_prior_orders=1, actions_last_hour=12) < 1.0
++
++
++def test_the_score_stays_within_bounds():
++    policy = MerchantPolicy(blocked_countries=["KP"])
++    worst = RISK.assess(
++        action(
++            amount_paise=POLICY.max_payment_paise,
++            buyer_age_days=0,
++            buyer_prior_orders=0,
++            buyer_country="KP",
++            ip_country="KP",
++            actions_last_hour=500,
++        ),
++        policy=policy,
++    )
++    assert 0.0 <= worst.score <= 1.0
++    assert worst.band is RiskBand.HIGH
++
++
++# --- bands and reporting ----------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "value,expected",
++    [
++        (0.0, RiskBand.LOW),
++        (LOW_MAX - 0.001, RiskBand.LOW),
++        (LOW_MAX, RiskBand.MEDIUM),
++        (MEDIUM_MAX - 0.001, RiskBand.MEDIUM),
++        (MEDIUM_MAX, RiskBand.HIGH),
++        (1.0, RiskBand.HIGH),
++    ],
++)
++def test_band_edges_are_where_they_are_documented(value, expected):
++    assert RiskService.band_for(value) is expected
++
++
++def test_signals_are_only_listed_when_they_fired():
++    assert RISK.assess(action(), policy=POLICY).signals == []
++    noisy = RISK.assess(action(buyer_age_days=0, buyer_prior_orders=0), policy=POLICY)
++    assert any("new_buyer" in s for s in noisy.signals)
++
++
++def test_an_assessment_serialises_for_storage():
++    payload = RISK.assess(action(ip_country="RU"), policy=POLICY).to_dict()
++    assert set(payload) == {"score", "band", "signals", "components", "metadata"}
++    assert payload["band"] in {"low", "medium", "high"}
++    assert set(payload["components"]) == {"amount", "geography", "new_buyer", "velocity"}
+-- 
+2.43.0
+
