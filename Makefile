@@ -1,15 +1,21 @@
-.PHONY: bootstrap dev dev-api dev-web test test-api test-web lint migrate seed down
+.PHONY: bootstrap db-up dev dev-api dev-web test test-api test-web lint migrate seed down
 
 COMPOSE := docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.dev.yml
 
-bootstrap:
-	@echo "Applying schema..."
-	psql "$(DATABASE_URL)" -f docs/SCHEMA.sql
-	@echo "Seeding dev catalog..."
-	psql "$(DATABASE_URL)" -f db/seeds/dev_products.sql
+# Migrations run as the owning role, which is exempt from RLS and so can
+# backfill across tenants. The API never connects as this one.
+MIGRATION_ROLE := keenpay_migration
+DB_NAME        := keenpay
+
+bootstrap: migrate seed
 
 dev-monitoring:
 	docker compose -f deploy/compose/docker-compose.yml -f deploy/compose/docker-compose.dev.yml -f deploy/compose/docker-compose.monitoring.yml up --build
+
+# Datastores only. Enough to run the integration suite without building the
+# application images.
+db-up:
+	$(COMPOSE) up -d postgres redis
 
 dev:
 	$(COMPOSE) up --build
@@ -56,11 +62,19 @@ lint-security:
 audit-deps:
 	cd api && pip-audit
 
+# Applied through the running container, so the only local dependency is
+# Docker. Ordered by filename and stopped at the first error: a migration that
+# half-applied and reported success is worse than one that refused.
 migrate:
-	@echo "Run pending SQL migrations from db/migrations/ in order"
+	@for f in db/migrations/*.sql; do \
+		echo "applying $$f"; \
+		$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 \
+			-U $(MIGRATION_ROLE) -d $(DB_NAME) < "$$f" || exit 1; \
+	done
 
 seed:
-	psql "$(DATABASE_URL)" -f db/seeds/dev_products.sql
+	@$(COMPOSE) exec -T postgres psql -v ON_ERROR_STOP=1 \
+		-U $(MIGRATION_ROLE) -d $(DB_NAME) < db/seeds/dev_products.sql
 
 down:
 	$(COMPOSE) down

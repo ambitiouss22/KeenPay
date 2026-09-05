@@ -9,6 +9,10 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Roles first. keenpay_app is NOBYPASSRLS and owns nothing, which is what
+      # makes the tenant policies apply to the API at all - without this the
+      # database comes up with no such role and the isolation suite cannot run.
+      - ../../db/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
       - ../../infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U keenpay"]
