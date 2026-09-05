@@ -2,8 +2,13 @@ services:
   postgres:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: keenpay
-      POSTGRES_PASSWORD: keenpay
+      # The bootstrap superuser, and deliberately NOT named keenpay*. It has
+      # BYPASSRLS, as every superuser does, so nothing that speaks for the
+      # application may ever use it - and naming it apart from the app roles is
+      # what stops it being picked up as a convenient connection string. The API
+      # connects as keenpay_app, which is NOBYPASSRLS and owns nothing.
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
       POSTGRES_DB: keenpay
     ports:
       - "5432:5432"
@@ -15,7 +20,7 @@ services:
       - ../../db/init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
       - ../../infra/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U keenpay"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
