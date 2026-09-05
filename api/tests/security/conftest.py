@@ -1,4 +1,10 @@
-"""Integration-test fixtures for the payment, event and ledger stores."""
+"""Security-test fixtures.
+
+The webhook store is a dedupe by design: an event id it has already seen is
+refused forever. Without a reset between tests, the second test to reuse a
+fixture id gets "duplicate" instead of the behaviour it is asserting, and the
+failure points at the handler rather than at the shared state.
+"""
 
 import pytest
 
@@ -12,8 +18,7 @@ from repositories.webhooks import reset_webhooks
 
 
 @pytest.fixture(autouse=True)
-def _reset_payment_stores():
-    """Keep payment, event and ledger state from leaking between tests."""
+def _reset_stores():
     reset_payments()
     reset_idempotency()
     reset_outbox()
