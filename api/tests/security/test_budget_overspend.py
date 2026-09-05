@@ -20,13 +20,17 @@ import uuid
 from pathlib import Path
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from core.jwt import JWTManager
 from repositories.campaigns import CampaignRepository, reset_campaigns
 from repositories.idempotency import reset_idempotency
 from repositories.opportunities import reset_opportunities
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.security]
+#: No ``asyncio`` mark: the suite runs pytest-asyncio in auto mode, and two of
+#: the tests below are deliberately synchronous. Marking the module would apply
+#: the mark to those as well and warn about it.
+pytestmark = pytest.mark.security
 
 MERCHANT = "merchant_keen"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -41,6 +45,31 @@ def _clean_growth_stores():
     reset_campaigns()
     reset_opportunities()
     reset_idempotency()
+
+
+@pytest.fixture
+def app():
+    """A fresh application per test, and the rate limiter is why.
+
+    The limiter holds its token buckets on the middleware instance, so an app
+    shared across the session is an allowance shared across the session: this
+    module races twenty reservations in one test, and every later test - in this
+    module or another - would then be answered 429.
+
+    A 429 is the worst possible failure for a security test. Each one here
+    asserts a specific refusal (403, 401, 409), and "refused because throttled"
+    would satisfy a weaker assertion while proving nothing about the permission
+    it was written to check. A per-test app makes the allowance per-test too.
+    """
+    from main import create_app
+
+    return create_app()
+
+
+@pytest.fixture
+async def client(app):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
 
 
 @pytest.fixture
@@ -271,17 +300,15 @@ async def test_a_campaign_cannot_be_opened_with_no_budget(client, admin):
     assert response.status_code == 422
 
 
-async def test_there_is_no_route_that_raises_a_budget(client, admin):
+def test_there_is_no_route_that_raises_a_budget(app):
     """A cap that can be raised on request is not a cap.
 
     Proved against the mounted application rather than against the source: a
     route added later shows up here whether or not anyone remembered this test.
     """
-    from main import create_app
-
     paths = {
         (route.path, method)
-        for route in create_app().routes
+        for route in app.routes
         for method in getattr(route, "methods", set())
     }
     mutating = {
