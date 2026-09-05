@@ -15,6 +15,17 @@ from config.settings import get_settings
 _MEMORY_ORDERS: dict[str, dict[str, Any]] = {}
 
 
+def reset_orders() -> None:
+    """Drop every order. For test isolation only.
+
+    Orders are looked up by payment link id, and a test fixture that reuses a
+    link id would otherwise resolve to whichever order an earlier test created
+    — already paid, already disputed — and the failure would look like a bug in
+    the handler rather than in the fixtures.
+    """
+    _MEMORY_ORDERS.clear()
+
+
 class OrderRepository:
     def __init__(self, session: AsyncSession | None = None) -> None:
         self._session = session
@@ -130,6 +141,31 @@ class OrderRepository:
             .first()
         )
         return dict(row) if row else None
+
+    async def set_status(self, order_id: str, status: str) -> dict[str, Any] | None:
+        """Move an order to a non-paid status.
+
+        Separate from :meth:`mark_paid` because settling also records the
+        provider payment id and the paid timestamp. This one carries the
+        outcomes that involve no payment — expired, disputed — and it refuses
+        to touch an order that is already paid: provider events arrive out of
+        order, and a late expiry must not unpay a settled order.
+        """
+        if self._memory:
+            order = _MEMORY_ORDERS.get(order_id)
+            if order and order.get("status") != "paid":
+                order["status"] = status
+                order["updated_at"] = datetime.now(UTC)
+            return order
+        assert self._session is not None
+        await self._session.execute(
+            text(
+                "UPDATE orders SET status = :status, updated_at = NOW() "
+                "WHERE id = :id AND status <> 'paid'"
+            ),
+            {"id": order_id, "status": status},
+        )
+        return await self.get(order_id)
 
     async def mark_paid(self, order_id: str, *, payment_id: str) -> dict[str, Any] | None:
         if self._memory:

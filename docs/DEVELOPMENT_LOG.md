@@ -4,6 +4,36 @@ Bugs, wrong turns, and fixes. Newest first. If you change anything that touches 
 
 ---
 
+### 2026-09-04 — UNKNOWN payments could never be reconciled
+
+**Symptom:** A payment whose capture timed out went to UNKNOWN with `provider_payment_id = NULL`, so the reconciliation pass had nothing to ask the provider about and the payment stayed UNKNOWN forever.
+**Root cause:** The provider's id was only persisted by `mark_captured()`, which by definition does not run when the capture times out. Exactly the payments that need reconciling were the ones that could not be.
+**Resolution:** `PaymentRepository.set_provider_reference()`, called immediately after `create_order()` returns and before capture is attempted.
+**Prevention:** Integration test drives timeout -> UNKNOWN -> reconciliation -> CAPTURED; the reconciliation engine records a `no_provider_reference` diff rather than silently skipping.
+**Files changed:** `api/repositories/payments.py`, `api/services/payments.py`, `api/modules/reconciliation/worker.py`
+
+---
+
+### 2026-09-04 — Webhook amount mismatch and replay hardening
+
+**Symptom:** The handler compared the event's amount to the order inline and had no freshness check, so a captured signature replayed later was still a valid event.
+**Root cause:** Verification, deduplication and application were interleaved in the route, and an event carrying no `amount` compared as "not equal" only by accident.
+**Resolution:** Extracted to `modules/webhooks/processor.py` with a fixed order — verify signature over raw bytes, reject events more than 5 minutes from now, claim the event id, only then act. Amount is compared against `orders.final_amount_paise`; any mismatch, including a missing amount, sets `payment_disputed` and returns 409. A late `payment_link.expired` can no longer unpay a settled order.
+**Prevention:** Replay, forged-signature, short-payment and malformed-body cases are in `tests/security/test_webhook_replay.py`.
+**Files changed:** `api/modules/webhooks/processor.py`, `api/routers/webhooks.py`, `api/repositories/webhooks.py`, `api/repositories/orders.py`
+
+---
+
+### 2026-09-04 — Reserved log key raised from inside the logging call
+
+**Symptom:** Every webhook that hit the duplicate, ignored or order-not-found path returned HTTP 500 with an enormous traceback.
+**Root cause:** `logger.info("webhook_duplicate", event=event_type)` — structlog binds the log message itself to `event`, so passing it as a keyword is a `TypeError` raised inside the logging call, surfacing as an unhandled exception in an unrelated handler.
+**Resolution:** Renamed to `event_type=`; the two `**dict` splats into loggers were made explicit named fields so a dict that later grows an `event` key cannot reintroduce it.
+**Prevention:** Never splat an untrusted dict into a structlog call. An AST sweep over `api/` and `workers/` reports zero remaining cases.
+**Files changed:** `api/modules/webhooks/processor.py`, `api/modules/reconciliation/worker.py`, `workers/jobs/reconciliation.py`
+
+---
+
 ### 2026-08-30 — Architecture and schema doc consolidation
 
 **Symptom:** Architecture and schema knowledge was split across multiple PDFs (`KeenPay_Architecture_Workflow`, `KEENPAY_Agentic_Commerce_Architecture_V4`, `KeenPay_Database_Schema`) and a separate auth migration.  

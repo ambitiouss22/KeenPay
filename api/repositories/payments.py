@@ -82,6 +82,25 @@ class PaymentRepository:
         payment["updated_at"] = datetime.now(UTC)
         return dict(payment)
 
+    async def set_provider_reference(
+        self, payment_id: str, provider_payment_id: str
+    ) -> dict[str, Any] | None:
+        """Record the provider's id for a payment as soon as it is known.
+
+        Written the moment the provider hands one back, not when the capture
+        succeeds — and that ordering is the whole point. A payment that times
+        out during capture goes to UNKNOWN, and reconciliation can only ask the
+        provider about it if we kept the id the provider answers to. Storing it
+        only on success meant exactly the payments that needed reconciling were
+        the ones that could not be reconciled.
+        """
+        payment = _MEMORY_PAYMENTS.get(payment_id)
+        if not payment or not provider_payment_id:
+            return None
+        payment["provider_payment_id"] = provider_payment_id
+        payment["updated_at"] = datetime.now(UTC)
+        return dict(payment)
+
     async def mark_captured(
         self,
         payment_id: str,
