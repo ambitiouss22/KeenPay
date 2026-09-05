@@ -44,6 +44,14 @@ class Permission(str, Enum):
     AUTHORIZATION_READ = "authorization:read"
     AUTHORIZATION_APPROVE = "authorization:approve"
     REFUND_REQUEST = "refund:request"
+    # --- merchant growth ---
+    # Split for the same reason the money gate is split: reading which
+    # suggestions exist and how much budget is left is a reporting act, while
+    # opening a campaign or taking budget out of circulation commits the
+    # merchant's money. One permission covering both would mean anyone who may
+    # look at a budget may also spend it.
+    GROWTH_READ = "growth:read"
+    GROWTH_MANAGE = "growth:manage"
 
 
 ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
@@ -64,6 +72,10 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.ESCALATION_READ,
             # Support can see why money was held, and can approve nothing.
             Permission.AUTHORIZATION_READ,
+            # Support answers "why was I offered this?" and "why did the
+            # discount stop applying?", so it reads growth state. It opens no
+            # campaigns and reserves no budget.
+            Permission.GROWTH_READ,
         }
     ),
     Role.MANAGER: frozenset(
@@ -81,6 +93,10 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             # Manager is the lowest role that may approve money movement.
             Permission.AUTHORIZATION_APPROVE,
             Permission.REFUND_REQUEST,
+            # Growth is a merchant decision about the merchant's own money, so
+            # it sits at the same level as approving one.
+            Permission.GROWTH_READ,
+            Permission.GROWTH_MANAGE,
         }
     ),
     Role.ADMIN: frozenset(Permission),
@@ -111,8 +127,9 @@ ROLE_PERMISSIONS: dict[Role, frozenset[Permission]] = {
             Permission.AUTHORIZATION_READ,
             # Deliberately absent, and the absence is the whole point:
             # AUTHORIZATION_APPROVE, REFUND_REQUEST, ADMIN_POLICY,
-            # ADMIN_USERS, API_KEY_MANAGE, WEBHOOK_INTERNAL. An agent asks;
-            # it never blesses, refunds, or reconfigures anything.
+            # ADMIN_USERS, API_KEY_MANAGE, WEBHOOK_INTERNAL, GROWTH_MANAGE.
+            # An agent asks; it never blesses, refunds, reconfigures anything,
+            # or takes a merchant's discount budget out of circulation.
         }
     ),
 }
@@ -128,6 +145,10 @@ SCOPE_PERMISSIONS: dict[str, Permission] = {
     Permission.ORDER_READ_OWN.value: Permission.ORDER_READ_OWN,
     Permission.AUTHORIZATION_REQUEST.value: Permission.AUTHORIZATION_REQUEST,
     Permission.AUTHORIZATION_READ.value: Permission.AUTHORIZATION_READ,
+    # The growth permissions are deliberately not here. A scope that cannot be
+    # named cannot be granted, so no agent credential - however it is requested,
+    # and whoever mints it - reaches a campaign budget. Adding a line here would
+    # be enough to undo that, which is why it is worth saying so out loud.
 }
 
 #: The most any agent credential may ever be granted. A request naming a scope
