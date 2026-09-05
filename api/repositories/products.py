@@ -21,7 +21,11 @@ _MEMORY_PRODUCTS: list[dict[str, Any]] = [
         "cost_paise": 120000,
         "quantity_on_hand": 50,
         "quantity_reserved": 0,
-        "attributes": {"color": "navy", "size": "M"},
+        "attributes": {
+            "color": "navy",
+            "size": "M",
+            "image_url": "/products/hoodie-navy.svg",
+        },
         "active": True,
     },
     {
@@ -34,7 +38,11 @@ _MEMORY_PRODUCTS: list[dict[str, Any]] = [
         "cost_paise": 120000,
         "quantity_on_hand": 35,
         "quantity_reserved": 0,
-        "attributes": {"color": "navy", "size": "L"},
+        "attributes": {
+            "color": "navy",
+            "size": "L",
+            "image_url": "/products/hoodie-navy.svg",
+        },
         "active": True,
     },
     {
@@ -47,7 +55,11 @@ _MEMORY_PRODUCTS: list[dict[str, Any]] = [
         "cost_paise": 45000,
         "quantity_on_hand": 100,
         "quantity_reserved": 0,
-        "attributes": {"color": "white", "size": "M"},
+        "attributes": {
+            "color": "white",
+            "size": "M",
+            "image_url": "/products/tee-white.svg",
+        },
         "active": True,
     },
 ]

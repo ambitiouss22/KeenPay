@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800" role="img" aria-label="KeenPay Product">
+  <title>KeenPay Product</title>
+  <rect width="800" height="800" rx="48" fill="#F1F6F2"/>
+  <rect x="24" y="24" width="752" height="752" rx="32" fill="none" stroke="#D5E4DA" stroke-width="2"/>
+  <g fill="#DCEADF" stroke="#A8C8B1" stroke-width="8" stroke-linejoin="round">
+    <path d="M400 216 L636 328 L636 552 L400 664 L164 552 L164 328 Z"/>
+  </g>
+  <g fill="none" stroke="#A8C8B1" stroke-width="7" stroke-linejoin="round">
+    <path d="M164 328 L400 440 L636 328"/><path d="M400 440 L400 664"/>
+  </g>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+    <text x="64" y="726" font-size="30" font-weight="700" fill="#456851" letter-spacing="0.5">KeenPay</text>
+    <text x="736" y="726" font-size="24" font-weight="500" fill="#6E9C7D" text-anchor="end">Product</text>
+  </g>
+</svg>

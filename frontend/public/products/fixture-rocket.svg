@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800" role="img" aria-label="Isolation fixture">
+  <title>Isolation fixture</title>
+  <rect width="800" height="800" rx="48" fill="#F3F2F1"/>
+  <rect x="24" y="24" width="752" height="752" rx="32" fill="none" stroke="#DEDBD7" stroke-width="2"/>
+  <g fill="#C9C5BF" stroke="#9E9A93" stroke-width="8" stroke-linejoin="round">
+    <path d="M400 176 C466 246 488 344 488 428 L488 528 L312 528 L312 428 C312 344 334 246 400 176 Z"/>
+    <path d="M312 438 L244 566 L312 528 Z"/>
+    <path d="M488 438 L556 566 L488 528 Z"/>
+  </g>
+  <circle cx="400" cy="336" r="44" fill="none" stroke="#8C877C" stroke-width="8"/>
+  <text x="64" y="726" font-family="ui-sans-serif, system-ui, sans-serif" font-size="26" font-weight="600" fill="#8C877C">Isolation fixture</text>
+</svg>

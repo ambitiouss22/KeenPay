@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800" role="img" aria-label="KeenPay Hoodie · Navy">
+  <title>KeenPay Hoodie · Navy</title>
+  <rect width="800" height="800" rx="48" fill="#EEF2F7"/>
+  <rect x="24" y="24" width="752" height="752" rx="32" fill="none" stroke="#D3DEEA" stroke-width="2"/>
+  <g fill="#42637E" stroke="#2F4A61" stroke-width="8" stroke-linejoin="round">
+    <path d="M300 248 C300 248 250 258 230 274 L152 512 L238 542 L244 628 Q244 642 258 642 L542 642 Q556 642 556 628 L562 542 L648 512 L570 274 C550 258 500 248 500 248 Z"/>
+    <path d="M296 252 C300 160 340 132 400 132 C460 132 500 160 504 252 C470 268 430 276 400 276 C370 276 330 268 296 252 Z"/>
+  </g>
+  <path d="M312 476 L488 476 L474 566 L326 566 Z" fill="none" stroke="#A5C4DC" stroke-width="7" stroke-linejoin="round"/>
+  <g stroke="#A5C4DC" stroke-width="7" stroke-linecap="round">
+    <path d="M366 272 L360 350"/><path d="M434 272 L440 350"/>
+  </g>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+    <text x="64" y="726" font-size="30" font-weight="700" fill="#42637E" letter-spacing="0.5">KeenPay</text>
+    <text x="736" y="726" font-size="24" font-weight="500" fill="#6A97BB" text-anchor="end">Hoodie · Navy</text>
+  </g>
+</svg>

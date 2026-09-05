@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800" role="img" aria-label="KeenPay Cap · White">
+  <title>KeenPay Cap · White</title>
+  <rect width="800" height="800" rx="48" fill="#F5F3FA"/>
+  <rect x="24" y="24" width="752" height="752" rx="32" fill="none" stroke="#DFD8EC" stroke-width="2"/>
+  <g fill="#FBFAFE" stroke="#BFB3DC" stroke-width="8" stroke-linejoin="round">
+    <path d="M220 472 C220 312 300 232 400 232 C500 232 580 312 580 472 Z"/>
+    <path d="M228 470 L648 474 Q698 478 698 500 Q698 522 648 526 L228 528 Q206 528 206 499 Q206 470 228 470 Z"/>
+  </g>
+  <g fill="none" stroke="#D7CFEA" stroke-width="7" stroke-linecap="round">
+    <path d="M400 238 L400 470"/>
+  </g>
+  <circle cx="400" cy="238" r="17" fill="#D7CFEA"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+    <text x="64" y="726" font-size="30" font-weight="700" fill="#5E4F7E" letter-spacing="0.5">KeenPay</text>
+    <text x="736" y="726" font-size="24" font-weight="500" fill="#8F7DBB" text-anchor="end">Cap · White</text>
+  </g>
+</svg>

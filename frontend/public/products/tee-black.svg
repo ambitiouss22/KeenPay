@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="800" height="800" role="img" aria-label="KeenPay Tee · Black">
+  <title>KeenPay Tee · Black</title>
+  <rect width="800" height="800" rx="48" fill="#F2F1EF"/>
+  <rect x="24" y="24" width="752" height="752" rx="32" fill="none" stroke="#DDDAD4" stroke-width="2"/>
+  <g fill="#3A372F" stroke="#26241E" stroke-width="8" stroke-linejoin="round">
+    <path d="M305 250 L236 276 L190 402 L262 432 L262 630 Q262 642 274 642 L526 642 Q538 642 538 630 L538 432 L610 402 L564 276 L495 250 C470 300 330 300 305 250 Z"/>
+  </g>
+  <path d="M305 250 C330 300 470 300 495 250" fill="none" stroke="#8C877C" stroke-width="7" stroke-linecap="round"/>
+  <g font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+    <text x="64" y="726" font-size="30" font-weight="700" fill="#3A372F" letter-spacing="0.5">KeenPay</text>
+    <text x="736" y="726" font-size="24" font-weight="500" fill="#635F56" text-anchor="end">Tee · Black</text>
+  </g>
+</svg>

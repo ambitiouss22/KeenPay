@@ -11,7 +11,7 @@
 -- rows whether the policy works or not. The isolation tests need a second
 -- tenant with data of its own to have anything to fail against.
 --
---   merchant_keen  -> the demo merchant the app runs as
+--   merchant_keen  -> the development merchant the app runs as
 --   merchant_acme  -> the neighbour that must never be visible
 --
 -- Idempotent: safe to re-run.
@@ -28,7 +28,7 @@ BEGIN;
 -- --- tenants ------------------------------------------------------------------
 
 INSERT INTO tenants (slug, name, settings) VALUES
-    ('merchant_keen', 'KeenPay Demo Merchant',
+    ('merchant_keen', 'KeenPay Development Merchant',
      '{"max_discount_pct": 15.0, "currency": "INR"}'::jsonb),
     ('merchant_acme', 'Acme Corp (isolation fixture)',
      '{"max_discount_pct": 5.0, "currency": "INR"}'::jsonb)
@@ -77,19 +77,24 @@ SELECT v.id, t.id, 'merchant_keen', v.sku, v.name, v.description,
   CROSS JOIN (VALUES
       ('prod_001', 'HOODIE-NAVY-M', 'Keen Hoodie Navy M',
        'Premium cotton hoodie, navy, medium', 249900, 120000, 50,
-       '{"color": "navy", "size": "M", "category": "apparel"}'),
+       '{"color": "navy", "size": "M", "category": "apparel",
+         "image_url": "/products/hoodie-navy.svg"}'),
       ('prod_002', 'HOODIE-NAVY-L', 'Keen Hoodie Navy L',
        'Premium cotton hoodie, navy, large', 249900, 120000, 35,
-       '{"color": "navy", "size": "L", "category": "apparel"}'),
+       '{"color": "navy", "size": "L", "category": "apparel",
+         "image_url": "/products/hoodie-navy.svg"}'),
       ('prod_003', 'TEE-BLACK-M', 'Keen Tee Black M',
        'Organic cotton t-shirt, black, medium', 99900, 45000, 100,
-       '{"color": "black", "size": "M", "category": "apparel"}'),
+       '{"color": "black", "size": "M", "category": "apparel",
+         "image_url": "/products/tee-black.svg"}'),
       ('prod_004', 'CAP-WHITE-OS', 'Keen Cap White',
        'Adjustable dad cap, white', 79900, 35000, 80,
-       '{"color": "white", "size": "OS", "category": "accessories"}'),
+       '{"color": "white", "size": "OS", "category": "accessories",
+         "image_url": "/products/cap-white.svg"}'),
       ('prod_005', 'BAG-TOTE-NAT', 'Keen Tote Natural',
        'Canvas tote bag, natural', 129900, 55000, 40,
-       '{"color": "natural", "category": "accessories"}')
+       '{"color": "natural", "category": "accessories",
+         "image_url": "/products/tote-natural.svg"}')
   ) AS v(id, sku, name, description, list_price, cost, qty, attrs)
  WHERE t.slug = 'merchant_keen'
 ON CONFLICT (merchant_id, sku) DO NOTHING;
@@ -108,10 +113,12 @@ SELECT v.id, t.id, 'merchant_acme', v.sku, v.name, v.description,
   CROSS JOIN (VALUES
       ('prod_acme_001', 'ACME-ANVIL', 'Acme Anvil',
        'Should never be visible to merchant_keen', 999900, 500000, 5,
-       '{"category": "hardware", "isolation_canary": true}'),
+       '{"category": "hardware", "isolation_canary": true,
+         "image_url": "/products/fixture-anvil.svg"}'),
       ('prod_acme_002', 'ACME-ROCKET', 'Acme Rocket Skates',
        'Should never be visible to merchant_keen', 1499900, 700000, 3,
-       '{"category": "hardware", "isolation_canary": true}')
+       '{"category": "hardware", "isolation_canary": true,
+         "image_url": "/products/fixture-rocket.svg"}')
   ) AS v(id, sku, name, description, list_price, cost, qty, attrs)
  WHERE t.slug = 'merchant_acme'
 ON CONFLICT (merchant_id, sku) DO NOTHING;
