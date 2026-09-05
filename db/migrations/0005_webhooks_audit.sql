@@ -32,8 +32,13 @@ ALTER TABLE webhook_events
 -- The initial schema made event_id unique globally. Scoping it to the merchant
 -- is both more correct and safer: two merchants must never be able to collide
 -- on, or probe for, each other's event ids.
-DROP INDEX IF EXISTS webhook_events_event_id_unique;
+-- The constraint first, then the index. The initial schema declared this as a
+-- UNIQUE *constraint*, and Postgres refuses to drop an index that a constraint
+-- still depends on -- so dropping the index first fails outright. Dropping the
+-- constraint takes its backing index with it; the DROP INDEX that follows is
+-- for a database where the same name was ever created as a bare index.
 ALTER TABLE webhook_events DROP CONSTRAINT IF EXISTS webhook_events_event_id_unique;
+DROP INDEX IF EXISTS webhook_events_event_id_unique;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_events_merchant_event
     ON webhook_events (merchant_id, event_id);
@@ -159,11 +164,13 @@ ALTER TABLE reconciliation_diffs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_ledger         ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS reconciliation_runs_tenant_isolation ON reconciliation_runs;
-CREATE POLICY reconciliation_runs_tenant_isolation ON reconciliation_runs
+DROP POLICY IF EXISTS tenant_isolation ON reconciliation_runs;
+CREATE POLICY tenant_isolation ON reconciliation_runs
     USING (tenant_id IS NULL OR tenant_id = current_setting('app.tenant_id', TRUE)::UUID);
 
 DROP POLICY IF EXISTS reconciliation_diffs_tenant_isolation ON reconciliation_diffs;
-CREATE POLICY reconciliation_diffs_tenant_isolation ON reconciliation_diffs
+DROP POLICY IF EXISTS tenant_isolation ON reconciliation_diffs;
+CREATE POLICY tenant_isolation ON reconciliation_diffs
     USING (
         run_id IN (
             SELECT id FROM reconciliation_runs
@@ -173,5 +180,6 @@ CREATE POLICY reconciliation_diffs_tenant_isolation ON reconciliation_diffs
     );
 
 DROP POLICY IF EXISTS audit_ledger_tenant_isolation ON audit_ledger;
-CREATE POLICY audit_ledger_tenant_isolation ON audit_ledger
+DROP POLICY IF EXISTS tenant_isolation ON audit_ledger;
+CREATE POLICY tenant_isolation ON audit_ledger
     USING (tenant_id IS NULL OR tenant_id = current_setting('app.tenant_id', TRUE)::UUID);

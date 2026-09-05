@@ -28,6 +28,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     ARRAY,
+    CHAR,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -823,6 +824,156 @@ class Event(Base):
 # -----------------------------------------------------------------------------
 
 #: Every table that must carry tenant_id and a row-level security policy.
+# -----------------------------------------------------------------------------
+# Tables introduced after the initial schema
+#
+# These five arrived with later migrations and were never mirrored here, so this
+# file quietly stopped describing the database it claims to be the source of
+# truth for. The audit ledger was among the missing ones, which is the worst
+# possible omission: the tamper-evidence store is exactly what a reader comes to
+# this file to understand.
+#
+# ``tenant_id`` is nullable on all of them, matching the migrations. Their
+# policies read ``tenant_id IS NULL OR tenant_id = ...`` so that rows written
+# before tenancy existed stay readable; new writes always set it.
+# -----------------------------------------------------------------------------
+
+
+class RiskScore(Base):
+    """One risk evaluation, kept for audit rather than for recomputation."""
+
+    __tablename__ = "risk_scores"
+    __table_args__ = (
+        CheckConstraint("score >= 0 AND score <= 1", name="risk_scores_score_range"),
+        CheckConstraint("band IN ('low', 'medium', 'high')", name="risk_scores_band_known"),
+    )
+
+    id: Mapped[uuid.UUID] = _pk_uuid()
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    merchant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("authorizations.id", ondelete="SET NULL")
+    )
+    action_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject_id: Mapped[str | None] = mapped_column(String(128))
+    amount_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: NUMERIC, not float. A float score does not compare equal to itself across
+    #: a round trip, and band edges are exactly the comparisons that would then
+    #: silently disagree with the application's.
+    score: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    band: Mapped[str] = mapped_column(String(8), nullable=False)
+    signals: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    components: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    policy_version: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = _created_at()
+
+
+class PaymentOutbox(Base):
+    """Events awaiting publication, written in the same transaction as the change.
+
+    Distinct from :class:`Outbox`, which is the general-purpose table from the
+    initial schema. This one is the payment path's own, so a backlog of payment
+    events cannot be starved by unrelated traffic.
+    """
+
+    __tablename__ = "payment_outbox"
+    __table_args__ = (Index("idx_outbox_unpublished", "created_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    merchant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, server_default="merchant_keen"
+    )
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenants.id")
+    )
+    aggregate_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    published: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[datetime] = _created_at()
+
+
+class AuditLedgerEntry(Base):
+    """One link in a merchant's hash chain. Append-only, enforced by trigger.
+
+    ``prev_hash`` is inside the hashed body, not merely stored beside it, so
+    entries cannot be reordered while each individual hash still checks out.
+    ``seq`` is unique per merchant and starts at 1: a gap is a removed entry,
+    and that is detectable without recomputing a single hash.
+    """
+
+    __tablename__ = "audit_ledger"
+    __table_args__ = (
+        UniqueConstraint("merchant_id", "seq", name="audit_ledger_merchant_seq_unique"),
+        CheckConstraint("seq > 0", name="audit_ledger_seq_positive"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    merchant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    correlation_id: Mapped[str | None] = mapped_column(String(128))
+    #: 64 hex characters of SHA-256, fixed width.
+    prev_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    entry_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    recorded_at: Mapped[datetime] = _created_at()
+
+
+class ReconciliationRun(Base):
+    """One pass of the reconciliation loop, and what it found."""
+
+    __tablename__ = "reconciliation_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running', 'completed', 'failed')",
+            name="reconciliation_status_known",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    merchant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False, server_default="scheduled")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="running")
+    checked: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    resolved_captured: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    resolved_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    still_unknown: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    unreachable: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    started_at: Mapped[datetime] = _created_at()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReconciliationDiff(Base):
+    """A disagreement between our record and the provider's.
+
+    Recorded rather than auto-applied. A difference the provider reports is
+    evidence, not an instruction: settling on it automatically is how a provider
+    bug becomes our accounting error.
+    """
+
+    __tablename__ = "reconciliation_diffs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("reconciliation_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    merchant_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    payment_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    local_value: Mapped[str | None] = mapped_column(Text)
+    provider_value: Mapped[str | None] = mapped_column(Text)
+    detail: Mapped[str | None] = mapped_column(Text)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _created_at()
+
+
 TENANT_SCOPED_TABLES: tuple[str, ...] = tuple(
     sorted(
         table.name
@@ -836,6 +987,7 @@ GLOBAL_TABLES: tuple[str, ...] = ("tenants",)
 
 __all__ = [
     "ApiKey",
+    "AuditLedgerEntry",
     "AuditLog",
     "AuthAuditLog",
     "Authorization",
@@ -858,9 +1010,13 @@ __all__ = [
     "PassportRecord",
     "Payment",
     "PaymentAttempt",
+    "PaymentOutbox",
     "Product",
     "Reconciliation",
+    "ReconciliationDiff",
+    "ReconciliationRun",
     "RefreshToken",
+    "RiskScore",
     "TENANT_SCOPED_TABLES",
     "Tenant",
     "User",
