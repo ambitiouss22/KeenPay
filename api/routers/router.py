@@ -46,6 +46,8 @@ REGISTRY: list[Mount] = [
     Mount("routers.policy", description="policy dry-run evaluation (phase 5)"),
     Mount("routers.authorizations", description="the money gate (phase 5)"),
     Mount("routers.payments", description="the money mover (phase 6)"),
+    Mount("routers.opportunities", description="growth suggestions"),
+    Mount("routers.campaigns", description="campaign budget and reservations"),
     Mount("routers.admin", description="escalations, policy"),
     Mount("routers.webhooks", description="razorpay callbacks"),
     Mount("routers.metrics", flag="enable_metrics", description="prometheus scrape"),
